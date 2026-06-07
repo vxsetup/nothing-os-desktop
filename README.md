@@ -1,6 +1,5 @@
-<<<<<<< HEAD
 # nothing-os-desktop
-=======
+
 <div align="center">
 
 <!-- Hero banner image, 1280×640 — make in Figma later -->
@@ -203,4 +202,4 @@ This is a **personal project** — code reflects my taste and Arch+Hyprland setu
 <sub>Not affiliated with Nothing Technology Limited</sub>
 
 </div>
->>>>>>> dc56f55 (● initial commit · nothing os desktop)
+
