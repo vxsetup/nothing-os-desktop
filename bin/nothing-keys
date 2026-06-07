@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Keybinds Viewer
+Shows all configured hotkeys parsed from hyprland.conf
+"""
+
+import os
+import sys
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        '/usr/lib/libgtk4-layer-shell.so',
+        '/usr/lib/libgtk4-layer-shell.so.0',
+        '/usr/lib64/libgtk4-layer-shell.so',
+        '/usr/lib64/libgtk4-layer-shell.so.0',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0',
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get('LD_PRELOAD', '')
+    if lib_path in current:
+        return
+    os.environ['LD_PRELOAD'] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+try:
+    gi.require_version('Gtk4LayerShell', '1.0')
+    from gi.repository import Gtk4LayerShell as LayerShell
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, Pango, GObject
+import re
+import signal
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / '.local/lib/nothing-os'))
+from nothing_anim import animate_show, animate_hide
+
+
+def parse_hyprland_binds():
+    """Parse bind lines from hyprland.conf. Returns list of (keys, command, description)."""
+    conf_paths = [
+        Path.home() / '.config' / 'hypr' / 'hyprland.conf',
+        Path.home() / '.config' / 'hypr' / 'binds.conf',
+    ]
+
+    binds = []
+    for conf_path in conf_paths:
+        if not conf_path.exists():
+            continue
+        try:
+            for line in conf_path.read_text().splitlines():
+                line = line.strip()
+
+                # Skip comments and empty
+                if not line or line.startswith('#'):
+                    continue
+
+                # Match bind, bindle, bindl, binde, etc.
+                m = re.match(r'^bind[a-z]*\s*=\s*(.+)$', line, re.IGNORECASE)
+                if not m:
+                    continue
+
+                parts = m.group(1).split(',', 2)
+                if len(parts) < 3:
+                    continue
+
+                mods = parts[0].strip()
+                key = parts[1].strip()
+                action = parts[2].strip()
+
+                # Build human-readable key combo
+                combo_parts = []
+                if mods:
+                    for mod in mods.split():
+                        mod = mod.strip()
+                        if mod.upper() == 'SUPER':
+                            combo_parts.append('Super')
+                        elif mod.upper() == 'SHIFT':
+                            combo_parts.append('Shift')
+                        elif mod.upper() == 'CTRL' or mod.upper() == 'CONTROL':
+                            combo_parts.append('Ctrl')
+                        elif mod.upper() == 'ALT':
+                            combo_parts.append('Alt')
+                        else:
+                            combo_parts.append(mod)
+
+                # Clean up key name
+                key_clean = key
+                if key.startswith('XF86'):
+                    key_map = {
+                        'XF86AudioRaiseVolume': 'Vol Up',
+                        'XF86AudioLowerVolume': 'Vol Down',
+                        'XF86AudioMute': 'Mute',
+                        'XF86AudioMicMute': 'Mic Mute',
+                        'XF86MonBrightnessUp': 'Bright Up',
+                        'XF86MonBrightnessDown': 'Bright Down',
+                    }
+                    key_clean = key_map.get(key, key.replace('XF86', ''))
+                elif key == 'Print':
+                    key_clean = 'PrtSc'
+                elif key == 'period':
+                    key_clean = '.'
+                elif key == 'SPACE':
+                    key_clean = 'Space'
+
+                combo_parts.append(key_clean)
+                combo = ' + '.join(combo_parts)
+
+                # Simplify action for display
+                action_clean = action.strip()
+                # Extract exec command
+                m_exec = re.match(r'exec\s*,\s*(.+)$', action_clean)
+                if m_exec:
+                    action_clean = m_exec.group(1).strip()
+
+                # Derive description from command
+                desc = action_clean
+                desc_map = {
+                    'nothing-launcher --toggle': 'App Launcher',
+                    'nothing-control --toggle': 'Control Center',
+                    'nothing-calendar --toggle': 'Calendar',
+                    'nothing-notifications --toggle': 'Notifications',
+                    'nothing-volume --toggle': 'Volume',
+                    'nothing-bluetooth --toggle': 'Bluetooth',
+                    'nothing-network --toggle': 'Network',
+                    'nothing-about --toggle': 'About',
+                    'nothing-lock': 'Lock Screen',
+                    'nothing-power-menu --toggle': 'Power Menu',
+                    'nothing-screenshot --region': 'Screenshot (Region)',
+                    'nothing-screenshot --screen': 'Screenshot (Screen)',
+                    'nothing-screenshot --toggle': 'Screenshot Menu',
+                    'nothing-recorder --toggle': 'Recorder Menu',
+                    'nothing-recorder --toggle-rec': 'Toggle Recording',
+                    'nothing-settings --toggle': 'Settings',
+                    'nothing-osd --vol-up': 'Volume Up',
+                    'nothing-osd --vol-down': 'Volume Down',
+                    'nothing-osd --vol-toggle': 'Toggle Mute',
+                    'nothing-osd --mic-toggle': 'Toggle Mic',
+                    'nothing-osd --bright-up': 'Brightness Up',
+                    'nothing-osd --bright-down': 'Brightness Down',
+                }
+
+                for cmd_match, d in desc_map.items():
+                    if cmd_match in desc:
+                        desc = d
+                        break
+
+                # Skip hyprctl dispatches that aren't interesting
+                if 'hyprctl dispatch' in action_clean:
+                    m_dispatch = re.match(r'hyprctl dispatch (\w+)\s*(.*)', action_clean)
+                    if m_dispatch:
+                        dispatch = m_dispatch.group(1)
+                        arg = m_dispatch.group(2).strip()
+                        dispatch_map = {
+                            'workspace': f'Workspace {arg}',
+                            'movetoworkspace': f'Move to WS {arg}',
+                            'fullscreen': 'Fullscreen',
+                            'togglefloating': 'Toggle Float',
+                            'killactive': 'Close Window',
+                            'movefocus': f'Focus {arg.title()}',
+                            'movewindow': f'Move {arg.title()}',
+                            'exit': 'Logout',
+                        }
+                        desc = dispatch_map.get(dispatch, f'{dispatch} {arg}')
+
+                binds.append({
+                    'combo': combo,
+                    'desc': desc,
+                    'raw': action_clean,
+                })
+        except Exception as e:
+            print(f"[error] parse {conf_path}: {e}", file=sys.stderr)
+
+    return binds
+
+
+def categorize_binds(binds):
+    """Group binds into categories."""
+    categories = {
+        'Nothing OS': [],
+        'Windows': [],
+        'Workspaces': [],
+        'Media': [],
+        'Other': [],
+    }
+
+    for b in binds:
+        raw = b['raw'].lower()
+        desc = b['desc'].lower()
+
+        if 'nothing-' in raw:
+            categories['Nothing OS'].append(b)
+        elif any(w in desc for w in ['volume', 'mute', 'bright', 'mic', 'player']):
+            categories['Media'].append(b)
+        elif any(w in desc for w in ['workspace', 'move to ws']):
+            categories['Workspaces'].append(b)
+        elif any(w in desc for w in ['close', 'fullscreen', 'float', 'focus', 'move']):
+            categories['Windows'].append(b)
+        else:
+            categories['Other'].append(b)
+
+    # Remove empty categories
+    return {k: v for k, v in categories.items() if v}
+
+
+# ── Main Window ────────────────────────────────────────────────
+
+class NothingKeysWindow(Adw.ApplicationWindow):
+
+    def __init__(self, app):
+        super().__init__(application=app)
+
+        self.set_title('nothing-keys')
+        self.set_default_size(480, 680)
+        self.set_resizable(False)
+        self.add_css_class('popup-window')
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, 'nothing-keys')
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 40)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class('outer-wrap')
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class('main-card')
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(24)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(20)
+
+        title = Gtk.Label(label='Keyboard Shortcuts', xalign=0.5)
+        title.add_css_class('window-title')
+        title.set_hexpand(True)
+        header.append(title)
+
+        card.append(header)
+
+        # Scrolled content
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        scrolled.set_kinetic_scrolling(True)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        content.set_margin_bottom(24)
+
+        # Parse and categorize
+        binds = parse_hyprland_binds()
+        categories = categorize_binds(binds)
+
+        for cat_name, cat_binds in categories.items():
+            # Section header
+            section_lbl = Gtk.Label(label=cat_name, xalign=0)
+            section_lbl.add_css_class('section-header')
+            section_lbl.set_margin_start(28)
+            section_lbl.set_margin_bottom(8)
+            content.append(section_lbl)
+
+            # Group card
+            group = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            group.add_css_class('group-card')
+            group.set_margin_start(20)
+            group.set_margin_end(20)
+
+            for i, bind in enumerate(cat_binds):
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+                row.add_css_class('key-row')
+
+                desc_lbl = Gtk.Label(label=bind['desc'], xalign=0)
+                desc_lbl.add_css_class('key-desc')
+                desc_lbl.set_hexpand(True)
+                desc_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+                row.append(desc_lbl)
+
+                combo_lbl = Gtk.Label(label=bind['combo'], xalign=1)
+                combo_lbl.add_css_class('key-combo')
+                row.append(combo_lbl)
+
+                group.append(row)
+
+                if i < len(cat_binds) - 1:
+                    div = Gtk.Box()
+                    div.add_css_class('row-divider')
+                    div.set_margin_start(16)
+                    div.set_size_request(-1, 1)
+                    group.append(div)
+
+            content.append(group)
+
+        # Empty state
+        if not categories:
+            empty = Gtk.Label(label='No keybinds found in hyprland.conf')
+            empty.add_css_class('empty-label')
+            empty.set_margin_top(40)
+            empty.set_margin_bottom(40)
+            content.append(empty)
+
+        scrolled.set_child(content)
+        card.append(scrolled)
+
+        bottom = Gtk.Box()
+        bottom.set_size_request(-1, 16)
+        card.append(bottom)
+
+        outer.append(card)
+        self.set_content(outer)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect('key-pressed', self._on_key)
+        self.add_controller(ctrl)
+
+    def show_window(self):
+        animate_show(self)
+
+    def hide_window(self):
+        animate_hide(self)
+
+    def toggle_window(self):
+        if self.get_visible():
+            self.hide_window()
+        else:
+            self.show_window()
+
+    def _on_key(self, ctrl, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_window()
+            return True
+        return False
+
+
+class NothingKeysApp(Adw.Application):
+
+    def __init__(self):
+        super().__init__(
+            application_id='tech.nothing.keys',
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+        )
+        self.window = None
+        for opt, short, desc in [
+            ('toggle', 't', 'Toggle'),
+            ('show', 's', 'Show'),
+            ('hide', 'h', 'Hide'),
+            ('daemon', 'd', 'Daemon'),
+            ('quit', 'q', 'Quit'),
+        ]:
+            self.add_main_option(opt, ord(short), GLib.OptionFlags.NONE,
+                                 GLib.OptionArg.NONE, desc, None)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        self._load_css()
+        self.window = NothingKeysWindow(self)
+        self.hold()
+
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict().end().unpack()
+        if 'quit' in options: self.quit(); return 0
+        if 'hide' in options: self.window.hide_window()
+        elif 'toggle' in options: self.window.toggle_window()
+        elif 'show' in options: self.window.show_window()
+        elif 'daemon' in options: pass
+        else: self.window.toggle_window()
+        return 0
+
+    def do_activate(self):
+        if self.window: self.window.toggle_window()
+
+    def _load_css(self):
+        p = Gtk.CssProvider()
+        p.load_from_data(CSS.encode())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), p,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+CSS = """
+window.popup-window { background: transparent; }
+.outer-wrap { background: transparent; padding: 0; }
+
+.main-card {
+    background: #0E0E10;
+    border-radius: 28px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.window-title {
+    font-family: "Inter", "SF Pro Display", -apple-system, sans-serif;
+    font-weight: 600;
+    font-size: 17px;
+    color: #FFFFFF;
+}
+
+.section-header {
+    font-family: "Inter", -apple-system, sans-serif;
+    font-weight: 400;
+    font-size: 12px;
+    color: #8E8E93;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.group-card {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.row-divider {
+    background: rgba(255, 255, 255, 0.06);
+    min-height: 1px;
+}
+
+.key-row {
+    padding: 11px 16px;
+}
+
+.key-desc {
+    font-family: "Inter", -apple-system, sans-serif;
+    font-weight: 400;
+    font-size: 14px;
+    color: #FFFFFF;
+}
+
+.key-combo {
+    font-family: "Inter", -apple-system, sans-serif;
+    font-weight: 500;
+    font-size: 12px;
+    color: #8E8E93;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    padding: 4px 10px;
+    letter-spacing: 0.3px;
+}
+
+.empty-label {
+    font-family: "Inter", -apple-system, sans-serif;
+    font-weight: 400;
+    font-size: 13px;
+    color: #8E8E93;
+}
+
+scrollbar { opacity: 0; min-width: 0; min-height: 0; }
+"""
+
+
+if __name__ == '__main__':
+    app = NothingKeysApp()
+    sys.exit(app.run(sys.argv))

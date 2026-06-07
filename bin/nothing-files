@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Quick File Browser
+Sidebar with bookmarks + recent + main file list
+Open files in default app, copy paths, navigate fast
+"""
+
+import os
+import sys
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        '/usr/lib/libgtk4-layer-shell.so',
+        '/usr/lib/libgtk4-layer-shell.so.0',
+        '/usr/lib64/libgtk4-layer-shell.so',
+        '/usr/lib64/libgtk4-layer-shell.so.0',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0',
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get('LD_PRELOAD', '')
+    if lib_path in current:
+        return
+    os.environ['LD_PRELOAD'] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+try:
+    gi.require_version('Gtk4LayerShell', '1.0')
+    from gi.repository import Gtk4LayerShell as LayerShell
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, Pango
+import subprocess
+import signal
+import json
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+sys.path.insert(0, str(Path.home() / '.local/lib/nothing-os'))
+from nothing_dna import (
+    DotGlyph, LiveDotMatrix, Color, SHARED_CSS,
+    build_header, build_accent_bar, build_section_header,
+)
+
+CONFIG_DIR = Path.home() / '.config' / 'nothing-files'
+CACHE_DIR = Path.home() / '.cache' / 'nothing-files'
+CONFIG_FILE = CONFIG_DIR / 'config.ini'
+BOOKMARKS_FILE = CONFIG_DIR / 'bookmarks.json'
+RECENT_FILE = CACHE_DIR / 'recent.json'
+
+DEFAULTS = {
+    'width': '760',
+    'height': '640',
+    'margin_top': '50',
+    'terminal': 'kitty',
+    'editor': 'nano',
+}
+
+
+# Default bookmarks if user hasn't customized
+DEFAULT_BOOKMARKS = [
+    {'name': 'home', 'path': str(Path.home())},
+    {'name': 'downloads', 'path': str(Path.home() / 'Downloads')},
+    {'name': 'documents', 'path': str(Path.home() / 'Documents')},
+    {'name': 'pictures', 'path': str(Path.home() / 'Pictures')},
+    {'name': 'videos', 'path': str(Path.home() / 'Videos')},
+    {'name': 'music', 'path': str(Path.home() / 'Music')},
+    {'name': 'desktop', 'path': str(Path.home() / 'Desktop')},
+    {'name': 'config', 'path': str(Path.home() / '.config')},
+]
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if not CONFIG_FILE.exists():
+        return cfg
+    try:
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            cfg[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return cfg
+
+
+def load_bookmarks():
+    if not BOOKMARKS_FILE.exists():
+        return DEFAULT_BOOKMARKS
+    try:
+        data = json.loads(BOOKMARKS_FILE.read_text())
+        return data if data else DEFAULT_BOOKMARKS
+    except Exception:
+        return DEFAULT_BOOKMARKS
+
+
+def save_bookmarks(bookmarks):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        BOOKMARKS_FILE.write_text(json.dumps(bookmarks, indent=2))
+    except Exception:
+        pass
+
+
+def load_recent():
+    if not RECENT_FILE.exists():
+        return []
+    try:
+        return json.loads(RECENT_FILE.read_text())
+    except Exception:
+        return []
+
+
+def add_recent(path):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        items = load_recent()
+        # Remove if already present
+        items = [i for i in items if i.get('path') != str(path)]
+        items.insert(0, {
+            'path': str(path),
+            'timestamp': datetime.now().isoformat(),
+        })
+        # Keep last 20
+        items = items[:20]
+        RECENT_FILE.write_text(json.dumps(items))
+    except Exception:
+        pass
+
+
+def clean_env():
+    env = os.environ.copy()
+    env.pop('LD_PRELOAD', None)
+    return env
+
+
+# ── File type detection ─────────────────────────────────────────
+
+def file_type_tag(path):
+    """Return short uppercase tag for file type."""
+    p = Path(path)
+    if p.is_dir():
+        return 'DIR'
+
+    ext = p.suffix.lower().lstrip('.')
+
+    type_map = {
+        # Images
+        'png': 'IMG', 'jpg': 'IMG', 'jpeg': 'IMG', 'gif': 'IMG',
+        'webp': 'IMG', 'svg': 'IMG', 'bmp': 'IMG', 'tiff': 'IMG',
+        'ico': 'IMG', 'heic': 'IMG',
+        # Video
+        'mp4': 'VID', 'mkv': 'VID', 'webm': 'VID', 'avi': 'VID',
+        'mov': 'VID', 'flv': 'VID', 'wmv': 'VID', 'm4v': 'VID',
+        # Audio
+        'mp3': 'AUD', 'wav': 'AUD', 'flac': 'AUD', 'ogg': 'AUD',
+        'm4a': 'AUD', 'opus': 'AUD', 'aac': 'AUD',
+        # Documents
+        'pdf': 'PDF', 'doc': 'DOC', 'docx': 'DOC', 'odt': 'DOC',
+        'xls': 'XLS', 'xlsx': 'XLS', 'ods': 'XLS',
+        'ppt': 'PPT', 'pptx': 'PPT', 'odp': 'PPT',
+        # Text / code
+        'txt': 'TXT', 'md': 'MD', 'rst': 'TXT', 'log': 'LOG',
+        'py': 'PY', 'js': 'JS', 'ts': 'TS', 'tsx': 'TS', 'jsx': 'JS',
+        'html': 'HTML', 'css': 'CSS', 'scss': 'CSS',
+        'json': 'JSON', 'yaml': 'YAML', 'yml': 'YAML',
+        'toml': 'CFG', 'ini': 'CFG', 'conf': 'CFG',
+        'c': 'C', 'cpp': 'C++', 'h': 'H', 'hpp': 'H',
+        'rs': 'RS', 'go': 'GO', 'java': 'JAVA',
+        'sh': 'SH', 'bash': 'SH', 'zsh': 'SH', 'fish': 'SH',
+        'rb': 'RB', 'php': 'PHP',
+        # Archives
+        'zip': 'ZIP', 'tar': 'TAR', 'gz': 'GZ', 'xz': 'XZ',
+        '7z': '7Z', 'rar': 'RAR', 'bz2': 'BZ2',
+        # Other
+        'iso': 'ISO', 'dmg': 'ISO', 'exe': 'EXE', 'deb': 'PKG',
+        'rpm': 'PKG', 'AppImage': 'APP',
+    }
+
+    return type_map.get(ext, ext.upper()[:4] if ext else 'FILE')
+
+
+def file_size_str(size):
+    try:
+        if size < 1024:
+            return f'{size}B'
+        if size < 1024 * 1024:
+            return f'{size // 1024}K'
+        if size < 1024 * 1024 * 1024:
+            return f'{size / 1024 / 1024:.1f}M'
+        return f'{size / 1024 / 1024 / 1024:.1f}G'
+    except Exception:
+        return '—'
+
+
+def format_time_ago(timestamp_iso):
+    try:
+        ts = datetime.fromisoformat(timestamp_iso)
+        delta = datetime.now() - ts
+        if delta.days > 0:
+            return f'{delta.days}D'
+        s = delta.seconds
+        if s > 3600:
+            return f'{s // 3600}H'
+        if s > 60:
+            return f'{s // 60}M'
+        return 'NOW'
+    except Exception:
+        return '—'
+
+
+def list_directory(path):
+    """List directory entries. Returns sorted list of dicts."""
+    try:
+        path = Path(path)
+        if not path.is_dir():
+            return []
+
+        items = []
+        for entry in path.iterdir():
+            try:
+                stat = entry.stat()
+                items.append({
+                    'name': entry.name,
+                    'path': str(entry),
+                    'is_dir': entry.is_dir(),
+                    'is_hidden': entry.name.startswith('.'),
+                    'size': stat.st_size if entry.is_file() else 0,
+                    'mtime': stat.st_mtime,
+                })
+            except (PermissionError, OSError):
+                continue
+
+        # Sort: dirs first, then by name
+        items.sort(key=lambda x: (not x['is_dir'], x['is_hidden'], x['name'].lower()))
+        return items
+    except (PermissionError, OSError, FileNotFoundError):
+        return []
+
+
+def open_in_default_app(path):
+    try:
+        subprocess.Popen(
+            ['xdg-open', str(path)],
+            env=clean_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[error] xdg-open: {e}", file=sys.stderr)
+        return False
+
+
+def open_in_terminal(path, terminal):
+    try:
+        subprocess.Popen(
+            [terminal, '-d', str(path)] if terminal == 'kitty' else [terminal],
+            env=clean_env(),
+            cwd=str(path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        # Fallback
+        try:
+            subprocess.Popen([terminal], cwd=str(path), env=clean_env(),
+                             start_new_session=True)
+            return True
+        except Exception:
+            return False
+
+
+def copy_path_to_clipboard(path):
+    try:
+        subprocess.run(['wl-copy'], input=str(path).encode(),
+                       env=clean_env(), check=False)
+        return True
+    except Exception:
+        return False
+
+
+# ── Sidebar Bookmark Row ────────────────────────────────────────
+
+class BookmarkRow(Gtk.Button):
+    def __init__(self, bookmark, on_select, selected=False):
+        super().__init__()
+        self.bookmark = bookmark
+        self.on_select = on_select
+        self.add_css_class('device-row')
+        self.add_css_class('bookmark-row')
+        if selected:
+            self.add_css_class('active')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_start(2)
+        box.set_margin_end(2)
+
+        dot = Gtk.Label(label='●' if selected else '○')
+        dot.add_css_class('device-dot')
+        box.append(dot)
+
+        lbl = Gtk.Label(label=bookmark['name'].upper(), xalign=0)
+        lbl.add_css_class('device-name')
+        lbl.add_css_class('bookmark-name')
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_hexpand(True)
+        box.append(lbl)
+
+        self.set_child(box)
+        self.connect('clicked', lambda b: on_select(bookmark['path']))
+
+
+# ── File List Row ───────────────────────────────────────────────
+
+class FileRow(Gtk.Button):
+    def __init__(self, item, on_activate, on_action):
+        super().__init__()
+        self.item = item
+        self.on_activate = on_activate
+        self.on_action = on_action
+        self.add_css_class('device-row')
+        self.add_css_class('file-row')
+        if item['is_dir']:
+            self.add_css_class('dir-row')
+        if item['is_hidden']:
+            self.add_css_class('hidden-row')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+
+        # Type icon — colored dot
+        if item['is_dir']:
+            glyph = '▢'
+        elif item['is_hidden']:
+            glyph = '·'
+        else:
+            glyph = '○'
+        dot = Gtk.Label(label=glyph)
+        dot.add_css_class('device-dot')
+        dot.add_css_class('file-glyph')
+        box.append(dot)
+
+        # Name
+        name_lbl = Gtk.Label(label=item['name'], xalign=0)
+        name_lbl.add_css_class('device-name')
+        name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        name_lbl.set_hexpand(True)
+        box.append(name_lbl)
+
+        # Size (for files only)
+        if not item['is_dir']:
+            size_lbl = Gtk.Label(label=file_size_str(item['size']))
+            size_lbl.add_css_class('file-size')
+            box.append(size_lbl)
+
+        # Type tag
+        tag = Gtk.Label(label=file_type_tag(item['path']))
+        if item['is_dir']:
+            tag.add_css_class('device-active-tag')
+        else:
+            tag.add_css_class('device-paired-tag')
+        box.append(tag)
+
+        self.set_child(box)
+        self.connect('clicked', lambda b: on_activate(item))
+
+        # Right-click for actions
+        right_click = Gtk.GestureClick()
+        right_click.set_button(3)
+        right_click.connect('pressed', lambda g, n, x, y: on_action(item))
+        self.add_controller(right_click)
+
+
+# ── Main Window ────────────────────────────────────────────────
+
+class NothingFilesWindow(Adw.ApplicationWindow):
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self.cfg = load_config()
+        self.bookmarks = load_bookmarks()
+        self.current_path = str(Path.home())
+        self.show_hidden = False
+        self.filter_query = ''
+        self.history_stack = []
+        self.forward_stack = []
+
+        self.set_title('nothing-files')
+        self.set_default_size(int(self.cfg['width']), int(self.cfg['height']))
+        self.set_resizable(False)
+        self.add_css_class('popup-window')
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, 'nothing-files')
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, int(self.cfg['margin_top']))
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class('outer-wrap')
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class('root-box')
+
+        header, self.header_indicator = build_header('FILES', long=False)
+        root.append(header)
+        root.append(build_accent_bar())
+
+        dots_wrap = Gtk.Box()
+        dots_wrap.set_halign(Gtk.Align.CENTER)
+        dots_wrap.set_margin_bottom(8)
+        self.top_dots = LiveDotMatrix(cols=44, rows=2, dot_size=2, spacing=7,
+                                       base_alpha=0.18, pulse=False)
+        dots_wrap.append(self.top_dots)
+        root.append(dots_wrap)
+
+        # ── Path bar + actions ────────────────────────────────
+        path_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        path_bar.add_css_class('volume-card')
+        path_bar.set_margin_start(20)
+        path_bar.set_margin_end(20)
+        path_bar.set_margin_bottom(12)
+
+        # Back button
+        back_btn = Gtk.Button(label='‹')
+        back_btn.add_css_class('icon-btn')
+        back_btn.add_css_class('nav-btn')
+        back_btn.set_size_request(42, 42)
+        back_btn.set_valign(Gtk.Align.CENTER)
+        back_btn.connect('clicked', lambda b: self._go_back())
+        path_bar.append(back_btn)
+
+        # Forward button
+        fwd_btn = Gtk.Button(label='›')
+        fwd_btn.add_css_class('icon-btn')
+        fwd_btn.add_css_class('nav-btn')
+        fwd_btn.set_size_request(42, 42)
+        fwd_btn.set_valign(Gtk.Align.CENTER)
+        fwd_btn.connect('clicked', lambda b: self._go_forward())
+        path_bar.append(fwd_btn)
+
+        # Up button
+        up_btn = Gtk.Button(label='↑')
+        up_btn.add_css_class('icon-btn')
+        up_btn.add_css_class('nav-btn')
+        up_btn.set_size_request(42, 42)
+        up_btn.set_valign(Gtk.Align.CENTER)
+        up_btn.connect('clicked', lambda b: self._go_up())
+        path_bar.append(up_btn)
+
+        # Path entry
+        self.path_entry = Gtk.Entry()
+        self.path_entry.add_css_class('launcher-entry')
+        self.path_entry.set_text(self.current_path)
+        self.path_entry.set_hexpand(True)
+        self.path_entry.connect('activate', self._on_path_entered)
+        path_bar.append(self.path_entry)
+
+        # Open terminal here button
+        term_btn = Gtk.Button(label='▢')
+        term_btn.add_css_class('icon-btn')
+        term_btn.add_css_class('nav-btn')
+        term_btn.set_size_request(42, 42)
+        term_btn.set_valign(Gtk.Align.CENTER)
+        term_btn.set_tooltip_text('Open terminal here')
+        term_btn.connect('clicked', lambda b: self._open_terminal())
+        path_bar.append(term_btn)
+
+        root.append(path_bar)
+
+        # Filter bar
+        filter_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        filter_bar.add_css_class('volume-card')
+        filter_bar.set_margin_start(20)
+        filter_bar.set_margin_end(20)
+        filter_bar.set_margin_bottom(12)
+
+        prompt = Gtk.Label(label='›')
+        prompt.add_css_class('search-prompt')
+        prompt.set_margin_start(8)
+        filter_bar.append(prompt)
+
+        self.filter_entry = Gtk.Entry()
+        self.filter_entry.add_css_class('launcher-entry')
+        self.filter_entry.set_placeholder_text('filter files in this folder')
+        self.filter_entry.set_hexpand(True)
+        self.filter_entry.connect('changed', self._on_filter_changed)
+        filter_bar.append(self.filter_entry)
+
+        # Hidden toggle
+        self.hidden_btn = Gtk.Button(label='HIDDEN')
+        self.hidden_btn.add_css_class('clear-btn')
+        self.hidden_btn.set_tooltip_text('Toggle hidden files (.dotfiles)')
+        self.hidden_btn.connect('clicked', self._toggle_hidden)
+        filter_bar.append(self.hidden_btn)
+
+        # Count
+        self.count_glyph = DotGlyph(text='0', dot_size=3, gap=1, char_gap=3,
+                                    color=Color.TEXT_HI, show_grid=True,
+                                    dim_alpha=0.06)
+        self.count_glyph.set_valign(Gtk.Align.CENTER)
+        self.count_glyph.set_margin_end(8)
+        filter_bar.append(self.count_glyph)
+
+        root.append(filter_bar)
+
+        # ── Main split: sidebar + file list ───────────────────
+        split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        split.set_margin_start(20)
+        split.set_margin_end(20)
+        split.set_margin_bottom(20)
+        split.set_vexpand(True)
+
+        # ── Sidebar (bookmarks + recent) ──────────────────────
+        sidebar_scrolled = Gtk.ScrolledWindow()
+        sidebar_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sidebar_scrolled.set_size_request(180, -1)
+        sidebar_scrolled.set_vexpand(True)
+
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        # Bookmarks
+        sidebar.append(build_section_header('bookmarks'))
+        self.bookmarks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        sidebar.append(self.bookmarks_box)
+
+        # Recent
+        sidebar.append(build_section_header('recent'))
+        self.recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        sidebar.append(self.recent_box)
+
+        sidebar_scrolled.set_child(sidebar)
+        split.append(sidebar_scrolled)
+
+        # ── File list ─────────────────────────────────────────
+        files_scrolled = Gtk.ScrolledWindow()
+        files_scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        files_scrolled.set_hexpand(True)
+        files_scrolled.set_vexpand(True)
+        files_scrolled.add_css_class('files-scrolled')
+
+        self.files_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        files_scrolled.set_child(self.files_box)
+
+        self.empty_lbl = Gtk.Label(label='— empty folder —')
+        self.empty_lbl.add_css_class('empty-label')
+
+        split.append(files_scrolled)
+
+        root.append(split)
+
+        outer.append(root)
+        self.set_content(outer)
+
+        self._refresh_bookmarks()
+        self._refresh_recent()
+        self._navigate(self.current_path, add_to_history=False)
+
+        # ESC closes, Backspace = up
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect('key-pressed', self._on_key)
+        self.add_controller(ctrl)
+
+    def show_window(self):
+        self._refresh_bookmarks()
+        self._refresh_recent()
+        self._refresh_files()
+        self.set_visible(True)
+        self.present()
+        GLib.idle_add(lambda: (self.filter_entry.grab_focus(), False)[1])
+
+    def hide_window(self):
+        self.set_visible(False)
+
+    def toggle_window(self):
+        if self.get_visible():
+            self.hide_window()
+        else:
+            self.show_window()
+
+    def _navigate(self, path, add_to_history=True):
+        path = str(Path(path).expanduser())
+        if not Path(path).is_dir():
+            return
+
+        if add_to_history and path != self.current_path:
+            self.history_stack.append(self.current_path)
+            self.forward_stack.clear()
+
+        self.current_path = path
+        self.path_entry.set_text(path)
+        self.filter_entry.set_text('')
+        self.filter_query = ''
+        self._refresh_files()
+        self._refresh_bookmarks()  # to update selection
+
+    def _go_back(self):
+        if self.history_stack:
+            self.forward_stack.append(self.current_path)
+            prev = self.history_stack.pop()
+            self.current_path = prev
+            self.path_entry.set_text(prev)
+            self._refresh_files()
+            self._refresh_bookmarks()
+
+    def _go_forward(self):
+        if self.forward_stack:
+            self.history_stack.append(self.current_path)
+            nxt = self.forward_stack.pop()
+            self.current_path = nxt
+            self.path_entry.set_text(nxt)
+            self._refresh_files()
+            self._refresh_bookmarks()
+
+    def _go_up(self):
+        parent = str(Path(self.current_path).parent)
+        if parent != self.current_path:
+            self._navigate(parent)
+
+    def _on_path_entered(self, entry):
+        path = entry.get_text().strip()
+        if path:
+            self._navigate(path)
+
+    def _on_filter_changed(self, entry):
+        self.filter_query = entry.get_text().lower()
+        self._refresh_files()
+
+    def _toggle_hidden(self, btn):
+        self.show_hidden = not self.show_hidden
+        if self.show_hidden:
+            btn.add_css_class('on')
+        else:
+            btn.remove_css_class('on')
+        self._refresh_files()
+
+    def _open_terminal(self):
+        open_in_terminal(self.current_path, self.cfg['terminal'])
+        self.hide_window()
+
+    def _refresh_bookmarks(self):
+        while child := self.bookmarks_box.get_first_child():
+            self.bookmarks_box.remove(child)
+
+        for bm in self.bookmarks:
+            is_selected = (str(Path(bm['path']).expanduser()) ==
+                           str(Path(self.current_path)))
+            row = BookmarkRow(bm, self._navigate, selected=is_selected)
+            self.bookmarks_box.append(row)
+
+    def _refresh_recent(self):
+        while child := self.recent_box.get_first_child():
+            self.recent_box.remove(child)
+
+        items = load_recent()
+        if not items:
+            empty = Gtk.Label(label='— none —')
+            empty.add_css_class('empty-label')
+            empty.set_margin_top(8)
+            empty.set_margin_bottom(8)
+            self.recent_box.append(empty)
+            return
+
+        for item in items[:10]:
+            path = item['path']
+            if not Path(path).exists():
+                continue
+            name = Path(path).name or path
+
+            btn = Gtk.Button()
+            btn.add_css_class('device-row')
+            btn.add_css_class('bookmark-row')
+
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            box.set_margin_start(2)
+            box.set_margin_end(2)
+
+            dot = Gtk.Label(label='·')
+            dot.add_css_class('device-dot')
+            box.append(dot)
+
+            lbl = Gtk.Label(label=name, xalign=0)
+            lbl.add_css_class('device-name')
+            lbl.add_css_class('bookmark-name')
+            lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+            lbl.set_hexpand(True)
+            box.append(lbl)
+
+            time_lbl = Gtk.Label(label=format_time_ago(item['timestamp']))
+            time_lbl.add_css_class('recent-time')
+            box.append(time_lbl)
+
+            btn.set_child(box)
+
+            # Click navigates to dir, or to file's dir
+            target = path if Path(path).is_dir() else str(Path(path).parent)
+            btn.connect('clicked', lambda b, t=target: self._navigate(t))
+
+            self.recent_box.append(btn)
+
+    def _refresh_files(self):
+        while child := self.files_box.get_first_child():
+            self.files_box.remove(child)
+
+        items = list_directory(self.current_path)
+
+        # Filter hidden
+        if not self.show_hidden:
+            items = [i for i in items if not i['is_hidden']]
+
+        # Filter by query
+        if self.filter_query:
+            items = [i for i in items if self.filter_query in i['name'].lower()]
+
+        self.count_glyph.set_text(str(len(items)))
+
+        if not items:
+            self.files_box.append(self.empty_lbl)
+            return
+
+        for item in items:
+            row = FileRow(item, self._on_file_activate, self._on_file_action)
+            self.files_box.append(row)
+
+    def _on_file_activate(self, item):
+        """Single click: navigate dir / open file."""
+        if item['is_dir']:
+            self._navigate(item['path'])
+        else:
+            add_recent(item['path'])
+            open_in_default_app(item['path'])
+            self.hide_window()
+
+    def _on_file_action(self, item):
+        """Right click: actions menu."""
+        # Simple popover menu
+        popover = Gtk.Popover()
+
+        menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        menu_box.set_margin_top(8)
+        menu_box.set_margin_bottom(8)
+        menu_box.set_margin_start(8)
+        menu_box.set_margin_end(8)
+
+        actions = [
+            ('OPEN', lambda: self._action_open(item)),
+            ('COPY PATH', lambda: self._action_copy_path(item)),
+            ('OPEN FOLDER', lambda: self._action_open_folder(item)),
+        ]
+        if item['is_dir']:
+            actions.append(('TERMINAL HERE', lambda: self._action_terminal(item)))
+
+        for label, callback in actions:
+            btn = Gtk.Button(label=label)
+            btn.add_css_class('notif-action')
+            btn.connect('clicked', lambda b, cb=callback: (cb(), popover.popdown()))
+            menu_box.append(btn)
+
+        popover.set_child(menu_box)
+        popover.set_parent(self)
+        popover.popup()
+
+    def _action_open(self, item):
+        add_recent(item['path'])
+        open_in_default_app(item['path'])
+        self.hide_window()
+
+    def _action_copy_path(self, item):
+        copy_path_to_clipboard(item['path'])
+
+    def _action_open_folder(self, item):
+        parent = str(Path(item['path']).parent)
+        self._navigate(parent)
+
+    def _action_terminal(self, item):
+        target = item['path'] if item['is_dir'] else str(Path(item['path']).parent)
+        open_in_terminal(target, self.cfg['terminal'])
+        self.hide_window()
+
+    def _on_key(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_window()
+            return True
+        # Backspace = go up (only if not focused on entry)
+        focused = self.get_focus()
+        if isinstance(focused, Gtk.Entry):
+            return False
+        if keyval == Gdk.KEY_BackSpace:
+            self._go_up()
+            return True
+        if keyval == Gdk.KEY_Left and state & Gdk.ModifierType.ALT_MASK:
+            self._go_back()
+            return True
+        if keyval == Gdk.KEY_Right and state & Gdk.ModifierType.ALT_MASK:
+            self._go_forward()
+            return True
+        return False
+
+
+class NothingFilesApp(Adw.Application):
+
+    def __init__(self):
+        super().__init__(
+            application_id='tech.nothing.files',
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+        )
+        self.window = None
+        for opt, short, desc in [
+            ('toggle', 't', 'Toggle'),
+            ('show', 's', 'Show'),
+            ('hide', 'h', 'Hide'),
+            ('daemon', 'd', 'Daemon'),
+            ('quit', 'q', 'Quit'),
+        ]:
+            self.add_main_option(opt, ord(short), GLib.OptionFlags.NONE,
+                                 GLib.OptionArg.NONE, desc, None)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        self._load_css()
+        self.window = NothingFilesWindow(self)
+        self.hold()
+
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict().end().unpack()
+        if 'quit' in options:
+            self.quit()
+            return 0
+        if 'hide' in options:
+            self.window.hide_window()
+        elif 'toggle' in options:
+            self.window.toggle_window()
+        elif 'show' in options:
+            self.window.show_window()
+        elif 'daemon' in options:
+            pass
+        else:
+            self.window.toggle_window()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_window()
+
+    def _load_css(self):
+        css_provider = Gtk.CssProvider()
+        css_path = CONFIG_DIR / 'style.css'
+        if css_path.exists():
+            css_provider.load_from_path(str(css_path))
+        else:
+            css_provider.load_from_data((SHARED_CSS + APP_CSS).encode())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+
+APP_CSS = """
+/* Path bar nav buttons */
+.nav-btn {
+    font-size: 16px !important;
+}
+
+.launcher-entry {
+    background: transparent;
+    border: none;
+    outline: none;
+    box-shadow: none;
+    color: #E8E6E3;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    padding: 6px 0;
+    min-height: 28px;
+}
+.launcher-entry:focus { box-shadow: none; outline: none; }
+.launcher-entry placeholder { color: #555555; font-weight: 500; }
+
+.search-prompt {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 18px;
+    color: #D63030;
+    font-weight: 700;
+}
+
+/* Bookmark row */
+.bookmark-row {
+    padding: 8px 12px;
+    min-height: 24px;
+}
+
+.bookmark-name {
+    font-size: 10px;
+    letter-spacing: 2px;
+    font-weight: 700;
+}
+
+.recent-time {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    color: #555555;
+    font-weight: 600;
+    letter-spacing: 1px;
+}
+
+/* File row */
+.file-row {
+    padding: 8px 14px;
+}
+
+.file-glyph {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    color: #555555;
+    font-weight: 700;
+}
+.dir-row .file-glyph {
+    color: #D63030;
+    text-shadow: 0 0 6px rgba(214, 48, 48, 0.4);
+}
+.dir-row .device-name {
+    color: #E8E6E3;
+    font-weight: 700;
+}
+
+.hidden-row .device-name {
+    color: #555555;
+    font-style: italic;
+}
+.hidden-row .file-glyph {
+    color: #2A2A2A;
+}
+
+.file-size {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    color: #666666;
+    font-weight: 600;
+    letter-spacing: 1px;
+    min-width: 36px;
+}
+
+/* Toggle button states */
+.clear-btn.on {
+    background: rgba(214, 48, 48, 0.1);
+    border-color: #D63030;
+    color: #D63030;
+}
+
+.clear-btn {
+    background: transparent;
+    border: 1px solid #2A1010;
+    color: #888888;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    border-radius: 6px;
+    padding: 4px 10px;
+    box-shadow: none;
+    transition: all 150ms ease;
+}
+.clear-btn:hover {
+    background: rgba(214, 48, 48, 0.08);
+    border-color: #D63030;
+    color: #D63030;
+}
+
+/* Action buttons in popover */
+.notif-action {
+    background: #060606;
+    border: 1px solid #242424;
+    color: #888888;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    border-radius: 8px;
+    padding: 8px 14px;
+    box-shadow: none;
+    transition: all 150ms ease;
+}
+.notif-action:hover {
+    background: #120606;
+    border-color: #D63030;
+    color: #D63030;
+}
+
+popover contents {
+    background: #080808;
+    border: 1px solid #1F1F1F;
+    border-radius: 10px;
+    padding: 0;
+}
+
+.files-scrolled {
+    background: #060606;
+    border: 1px solid #161616;
+    border-radius: 12px;
+    padding: 4px;
+}
+"""
+
+
+if __name__ == '__main__':
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingFilesApp()
+    sys.exit(app.run(sys.argv))

@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — OSD
+On-screen display for volume/brightness/mic/caps/num lock.
+Unified with nothing-control / nothing-volume design language:
+  - dot-matrix hero number (huge, instant recognition)
+  - dot-matrix progress bar
+  - premium cairo icons
+  - 100ms fade-in, 150ms fade-out
+  - auto-hide after 1500ms
+  - centered, floating capsule shape
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import math
+import re
+import subprocess
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+
+
+def _run(cmd, timeout=2):
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=timeout
+        ).stdout
+    except Exception:
+        return ""
+
+
+# ═════════════════════════════════════════════════════════════
+#  Backends
+# ═════════════════════════════════════════════════════════════
+
+
+class Volume:
+    @staticmethod
+    def get():
+        out = _run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+        m = re.findall(r"(\d+)%", out)
+        return int(sum(map(int, m)) / len(m)) if m else 0
+
+    @staticmethod
+    def muted():
+        return "yes" in _run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"])
+
+    @staticmethod
+    def set(v):
+        v = max(0, min(150, v))
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{v}%"])
+
+    @staticmethod
+    def toggle_mute():
+        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"])
+
+
+class MicVolume:
+    @staticmethod
+    def get():
+        out = _run(["pactl", "get-source-volume", "@DEFAULT_SOURCE@"])
+        m = re.findall(r"(\d+)%", out)
+        return int(sum(map(int, m)) / len(m)) if m else 0
+
+    @staticmethod
+    def muted():
+        return "yes" in _run(["pactl", "get-source-mute", "@DEFAULT_SOURCE@"])
+
+    @staticmethod
+    def toggle_mute():
+        subprocess.run(["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "toggle"])
+
+
+class Brightness:
+    @staticmethod
+    def get():
+        cur = _run(["brightnessctl", "get"]).strip()
+        mx = _run(["brightnessctl", "max"]).strip()
+        try:
+            return int(int(cur) / int(mx) * 100)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def step_up():
+        subprocess.run(["brightnessctl", "set", "+5%"], capture_output=True)
+
+    @staticmethod
+    def step_down():
+        subprocess.run(["brightnessctl", "set", "5%-"], capture_output=True)
+
+
+def caps_state():
+    try:
+        for ledfile in (
+            "/sys/class/leds/input2::capslock/brightness",
+            "/sys/class/leds/input1::capslock/brightness",
+            "/sys/class/leds/input0::capslock/brightness",
+        ):
+            if os.path.exists(ledfile):
+                with open(ledfile) as f:
+                    return f.read().strip() != "0"
+    except Exception:
+        pass
+    out = _run(["xset", "q"])
+    return "Caps Lock:   on" in out
+
+
+def num_state():
+    out = _run(["xset", "q"])
+    return "Num Lock:    on" in out
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Premium cairo icons (size-parameterized, color-aware)
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_speaker(cr, cx, cy, muted=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE)
+    elif muted:
+        col = (*RED, 1.0)
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.36
+    cr.move_to(cx - s, cy - s * 0.35)
+    cr.line_to(cx - s * 0.35, cy - s * 0.35)
+    cr.line_to(cx + s * 0.10, cy - s * 0.80)
+    cr.line_to(cx + s * 0.10, cy + s * 0.80)
+    cr.line_to(cx - s * 0.35, cy + s * 0.35)
+    cr.line_to(cx - s, cy + s * 0.35)
+    cr.close_path()
+    cr.fill()
+    if muted:
+        cr.set_line_width(2.0)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(cx + s * 0.40, cy - s * 0.55)
+        cr.line_to(cx + s * 1.05, cy + s * 0.55)
+        cr.move_to(cx + s * 1.05, cy - s * 0.55)
+        cr.line_to(cx + s * 0.40, cy + s * 0.55)
+        cr.stroke()
+    else:
+        cr.set_line_width(1.8)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.arc(cx + s * 0.10, cy, s * 0.50, -0.55, 0.55)
+        cr.stroke()
+        cr.arc(cx + s * 0.10, cy, s * 0.85, -0.55, 0.55)
+        cr.stroke()
+
+
+def _draw_mic(cr, cx, cy, muted=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE)
+    elif muted:
+        col = (*RED, 1.0)
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.30
+    round_rect(cr, cx - s * 0.55, cy - s * 1.05, s * 1.10, s * 1.30, s * 0.55)
+    cr.fill()
+    cr.arc(cx, cy + s * 0.10, s * 0.85, 0.25, math.pi - 0.25)
+    cr.stroke()
+    cr.move_to(cx, cy + s * 0.95)
+    cr.line_to(cx, cy + s * 1.30)
+    cr.stroke()
+    cr.move_to(cx - s * 0.50, cy + s * 1.30)
+    cr.line_to(cx + s * 0.50, cy + s * 1.30)
+    cr.stroke()
+    if muted:
+        cr.set_line_width(2.4)
+        cr.move_to(cx - size * 0.42, cy - size * 0.42)
+        cr.line_to(cx + size * 0.42, cy + size * 0.42)
+        cr.stroke()
+
+
+def _draw_sun(cr, cx, cy, muted=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    r_inner = size * 0.16
+    cr.arc(cx, cy, r_inner, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    for i in range(8):
+        a = i * math.pi / 4
+        x1 = cx + math.cos(a) * size * 0.26
+        y1 = cy + math.sin(a) * size * 0.26
+        x2 = cx + math.cos(a) * size * 0.42
+        y2 = cy + math.sin(a) * size * 0.42
+        cr.move_to(x1, y1)
+        cr.line_to(x2, y2)
+        cr.stroke()
+
+
+def _draw_caps(cr, cx, cy, active=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE)
+    elif active:
+        col = (*RED, 1.0)
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.38
+    # Up arrow
+    cr.move_to(cx, cy - s)
+    cr.line_to(cx + s * 0.75, cy - s * 0.10)
+    cr.line_to(cx + s * 0.35, cy - s * 0.10)
+    cr.line_to(cx + s * 0.35, cy + s * 0.45)
+    cr.line_to(cx - s * 0.35, cy + s * 0.45)
+    cr.line_to(cx - s * 0.35, cy - s * 0.10)
+    cr.line_to(cx - s * 0.75, cy - s * 0.10)
+    cr.close_path()
+    cr.fill()
+    # Underline
+    cr.set_line_width(2.2)
+    cr.move_to(cx - s * 0.55, cy + s * 0.80)
+    cr.line_to(cx + s * 0.55, cy + s * 0.80)
+    cr.stroke()
+
+
+def _draw_num(cr, cx, cy, active=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE)
+    elif active:
+        col = (*RED, 1.0)
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    s = size * 0.36
+    round_rect(cr, cx - s, cy - s, s * 2, s * 2, 2)
+    cr.set_line_width(1.8)
+    cr.stroke()
+    cr.select_font_face("JetBrains Mono", 0, 1)
+    cr.set_font_size(size * 0.50)
+    ext = cr.text_extents("1")
+    cr.move_to(cx - ext.width / 2 - ext.x_bearing, cy + ext.height / 2 - 0.5)
+    cr.show_text("1")
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hero dot-matrix number
+# ═════════════════════════════════════════════════════════════
+
+DOT_FONT = {
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "N": ["10001", "11001", "10101", "10101", "10101", "10011", "10001"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+}
+
+
+class HeroNumber(Gtk.DrawingArea):
+    """Big dot-matrix hero — number or short text like ON/OFF/MUTE."""
+
+    def __init__(self, height=70):
+        super().__init__()
+        self.text = "0"
+        self.accent = False
+        self.set_content_height(height)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+    def set_text(self, t, accent=False):
+        t = str(t).upper()
+        if t != self.text or accent != self.accent:
+            self.text = t
+            self.accent = accent
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        chars = list(self.text)
+        rows = 7
+        # Larger cell for OSD hero presence
+        cell = min(h / (rows + 1.2), 9)
+        char_w = 5 * cell
+        gap = cell * 0.6
+        total_w = len(chars) * char_w + (len(chars) - 1) * gap
+        start_x = (w - total_w) / 2
+        start_y = (h - rows * cell) / 2
+        dot_r = cell * 0.42
+        dot_r_off = cell * 0.16
+
+        on_color = (*RED, 1.0) if self.accent else (1, 1, 1, 1)
+
+        for ci, ch in enumerate(chars):
+            glyph = DOT_FONT.get(ch, DOT_FONT[" "])
+            gx = start_x + ci * (char_w + gap)
+            for r in range(rows):
+                for c in range(5):
+                    x = gx + c * cell + cell / 2
+                    y = start_y + r * cell + cell / 2
+                    on = glyph[r][c] == "1"
+                    if on:
+                        cr.set_source_rgba(*on_color)
+                        cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                    else:
+                        cr.set_source_rgba(*WHITE_06)
+                        cr.arc(x, y, dot_r_off, 0, 2 * math.pi)
+                    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Dot progress bar — Nothing-style 20 dots
+# ═════════════════════════════════════════════════════════════
+
+
+class DotProgressBar(Gtk.DrawingArea):
+    """20-dot progress (0..100% mapped, with 100..150 overflow zone)."""
+
+    DOT_COUNT = 20
+    OVER_DOTS = 4  # last 4 dots represent 100..150% overflow zone
+
+    def __init__(self):
+        super().__init__()
+        self.value = 0
+        self.muted = False
+        self.set_content_height(10)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+    def set_value(self, v, muted=False):
+        v = max(0, min(150, int(v)))
+        if v != self.value or muted != self.muted:
+            self.value = v
+            self.muted = muted
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cy = h / 2
+        n = self.DOT_COUNT
+        gap = w / (n + 1)
+        # Number of dots to "fill" based on value (0..150 mapped to 0..n)
+        ratio = self.value / 150
+        filled = ratio * n
+
+        for i in range(n):
+            x = gap * (i + 1)
+            is_over_zone = i >= n - self.OVER_DOTS
+            is_filled = i < filled
+            partial = filled - i if (0 < filled - i < 1) else 1.0
+
+            if not is_filled:
+                # Off dot
+                cr.set_source_rgba(*WHITE_12)
+                cr.arc(x, cy, 1.6, 0, 2 * math.pi)
+                cr.fill()
+                continue
+
+            # On dot — pick color
+            if self.muted:
+                color = WHITE_25
+            elif is_over_zone:
+                color = (*RED, 1.0 * partial if partial < 1 else 1.0)
+            else:
+                color = (1, 1, 1, 1.0 * partial if partial < 1 else 1.0)
+
+            cr.set_source_rgba(*color)
+            cr.arc(x, cy, 2.6, 0, 2 * math.pi)
+            cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main OSD window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingOSDWindow(Adw.ApplicationWindow):
+    HIDE_DELAY_MS = 1500
+    FADE_IN_MS = 100
+    FADE_OUT_MS = 150
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._hide_timer = None
+        self._fadeout_pending = False
+
+        self.set_default_size(320, 180)
+        self.set_resizable(False)
+        self.add_css_class("osd-window")
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-osd")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            # Center top
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 80)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.NONE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        # Scroller wrap (gives us the rounded background)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+        scroll.set_vexpand(True)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Top header — icon + label (caps subtitle) ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(18)
+        header.set_margin_start(22)
+        header.set_margin_end(22)
+        header.set_margin_bottom(10)
+        header.set_halign(Gtk.Align.CENTER)
+
+        self.icon = Gtk.DrawingArea()
+        self.icon.set_content_width(20)
+        self.icon.set_content_height(20)
+        self.icon.set_valign(Gtk.Align.CENTER)
+        self._icon_fn = lambda cr, cx, cy: None
+        self.icon.set_draw_func(self._draw_icon)
+        header.append(self.icon)
+
+        self.label = Gtk.Label(label="")
+        self.label.add_css_class("osd-label")
+        self.label.set_valign(Gtk.Align.CENTER)
+        header.append(self.label)
+
+        card.append(header)
+
+        # ─── Hero number (dot-matrix) ───
+        hero_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        hero_wrap.set_halign(Gtk.Align.CENTER)
+        hero_wrap.set_margin_start(16)
+        hero_wrap.set_margin_end(16)
+        hero_wrap.set_margin_bottom(8)
+
+        self.hero = HeroNumber(height=64)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero_wrap.append(self.hero)
+        card.append(hero_wrap)
+
+        # ─── Dot progress bar ───
+        self.bar_wrap = Gtk.Box()
+        self.bar_wrap.set_margin_start(22)
+        self.bar_wrap.set_margin_end(22)
+        self.bar_wrap.set_margin_top(2)
+        self.bar_wrap.set_margin_bottom(18)
+
+        self.bar = DotProgressBar()
+        self.bar_wrap.append(self.bar)
+        card.append(self.bar_wrap)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+    def _draw_icon(self, area, cr, w, h):
+        self._icon_fn(cr, w / 2, h / 2)
+
+    def _show(self):
+        # Cancel pending hide
+        if self._hide_timer:
+            GLib.source_remove(self._hide_timer)
+            self._hide_timer = None
+
+        if not self.get_visible():
+            self.set_visible(True)
+            self.set_opacity(0.0)
+            self.present()
+            fade_in(self, duration_ms=self.FADE_IN_MS)
+        else:
+            self.set_opacity(1.0)
+
+        self._hide_timer = GLib.timeout_add(self.HIDE_DELAY_MS, self._start_hide)
+
+    def _start_hide(self):
+        self._hide_timer = None
+        fade_out(
+            self, duration_ms=self.FADE_OUT_MS, on_done=lambda: self.set_visible(False)
+        )
+        return False
+
+    # ─── Public API ──────────────────────────────────────
+
+    def show_volume(self, vol=None, muted=None):
+        if vol is None:
+            vol = Volume.get()
+        if muted is None:
+            muted = Volume.muted()
+        self._icon_fn = lambda cr, cx, cy: _draw_speaker(
+            cr, cx, cy, muted=muted, size=20
+        )
+        self.icon.queue_draw()
+        self.label.set_text("OUTPUT VOLUME")
+        if muted:
+            self.hero.set_text("MUTE", accent=True)
+        else:
+            self.hero.set_text(str(vol), accent=(vol > 100))
+        self.bar.set_value(vol, muted)
+        self.bar_wrap.set_visible(True)
+        self._show()
+
+    def show_mic(self, vol=None, muted=None):
+        if vol is None:
+            vol = MicVolume.get()
+        if muted is None:
+            muted = MicVolume.muted()
+        self._icon_fn = lambda cr, cx, cy: _draw_mic(cr, cx, cy, muted=muted, size=20)
+        self.icon.queue_draw()
+        self.label.set_text("MICROPHONE")
+        if muted:
+            self.hero.set_text("MUTE", accent=True)
+        else:
+            self.hero.set_text(str(vol), accent=False)
+        self.bar.set_value(vol, muted)
+        self.bar_wrap.set_visible(True)
+        self._show()
+
+    def show_brightness(self, val=None):
+        if val is None:
+            val = Brightness.get()
+        self._icon_fn = lambda cr, cx, cy: _draw_sun(cr, cx, cy, size=20)
+        self.icon.queue_draw()
+        self.label.set_text("BRIGHTNESS")
+        self.hero.set_text(str(val), accent=False)
+        self.bar.set_value(val, False)
+        self.bar_wrap.set_visible(True)
+        self._show()
+
+    def show_caps(self, on=None):
+        if on is None:
+            on = caps_state()
+        self._icon_fn = lambda cr, cx, cy: _draw_caps(cr, cx, cy, active=on, size=20)
+        self.icon.queue_draw()
+        self.label.set_text("CAPS LOCK")
+        self.hero.set_text("ON" if on else "OFF", accent=on)
+        self.bar_wrap.set_visible(False)
+        self._show()
+
+    def show_num(self, on=None):
+        if on is None:
+            on = num_state()
+        self._icon_fn = lambda cr, cx, cy: _draw_num(cr, cx, cy, active=on, size=20)
+        self.icon.queue_draw()
+        self.label.set_text("NUM LOCK")
+        self.hero.set_text("ON" if on else "OFF", accent=on)
+        self.bar_wrap.set_visible(False)
+        self._show()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingOSDApp(Adw.Application):
+    EXTRA_CSS = """
+    /* OSD label — caps subtitle under icon */
+    .osd-label {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.55);
+        letter-spacing: 3px;
+    }
+
+    /* OSD window — narrower, floating */
+    .osd-window .card-scroller {
+        background: rgba(11, 11, 12, 0.96);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 22px;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.osd",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        opts = [
+            ("vol-up", "u", "Volume up"),
+            ("vol-down", "d", "Volume down"),
+            ("vol-mute", "m", "Mute output"),
+            ("vol-show", "v", "Show current volume"),
+            ("mic-mute", "M", "Mute microphone"),
+            ("mic-show", "V", "Show current mic"),
+            ("br-up", "b", "Brightness up"),
+            ("br-down", "B", "Brightness down"),
+            ("br-show", "r", "Show current brightness"),
+            ("caps", "c", "Show capslock state"),
+            ("num", "n", "Show numlock state"),
+            ("daemon", "D", "Daemon mode"),
+            ("quit", "q", "Quit"),
+        ]
+        for opt, short, desc in opts:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingOSDWindow(self)
+        self.hold()
+
+    def do_activate(self):
+        pass
+
+    def do_command_line(self, command_line):
+        opts = command_line.get_options_dict().end().unpack()
+        w = self.window
+
+        if "quit" in opts:
+            self.quit()
+            return 0
+
+        if "vol-up" in opts:
+            new = min(150, Volume.get() + 5)
+            Volume.set(new)
+            w.show_volume(new, Volume.muted())
+            return 0
+
+        if "vol-down" in opts:
+            new = max(0, Volume.get() - 5)
+            Volume.set(new)
+            w.show_volume(new, Volume.muted())
+            return 0
+
+        if "vol-mute" in opts:
+            Volume.toggle_mute()
+            w.show_volume(Volume.get(), Volume.muted())
+            return 0
+
+        if "vol-show" in opts:
+            w.show_volume()
+            return 0
+
+        if "mic-mute" in opts:
+            MicVolume.toggle_mute()
+            w.show_mic()
+            return 0
+
+        if "mic-show" in opts:
+            w.show_mic()
+            return 0
+
+        if "br-up" in opts:
+            Brightness.step_up()
+            w.show_brightness()
+            return 0
+
+        if "br-down" in opts:
+            Brightness.step_down()
+            w.show_brightness()
+            return 0
+
+        if "br-show" in opts:
+            w.show_brightness()
+            return 0
+
+        if "caps" in opts:
+            w.show_caps()
+            return 0
+
+        if "num" in opts:
+            w.show_num()
+            return 0
+
+        if "daemon" in opts:
+            return 0
+
+        w.show_volume()
+        return 0
+
+
+if __name__ == "__main__":
+    app = NothingOSDApp()
+    sys.exit(app.run(sys.argv))

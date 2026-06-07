@@ -1,0 +1,921 @@
+/* ═══════════════════════════════════════════════════════════
+   Nothing OS — GTK 3 (legacy apps)
+   Premium pill-based theme: dark surfaces, red accent, mono labels
+   Palette: #FF2D2D / #F7F7F7 / #141416
+   ═══════════════════════════════════════════════════════════ */
+
+/* ─── Design tokens ──────────────────────────────────────── */
+
+@define-color accent              #FF2D2D;
+@define-color accent_hover        #FF4747;
+@define-color accent_subtle       rgba(255, 45, 45, 0.10);
+@define-color accent_border       rgba(255, 45, 45, 0.40);
+
+@define-color bg_base             #0F0F11;
+@define-color bg_card             #141416;
+@define-color bg_card_elevated    #1A1A1D;
+
+@define-color fg_primary          #F7F7F7;
+@define-color fg_secondary        #C8C8CC;
+@define-color fg_tertiary         #8E8E93;
+@define-color fg_muted            #6E6E73;
+@define-color fg_disabled         #4A4A4F;
+
+@define-color border_subtle       rgba(255, 255, 255, 0.06);
+@define-color border_default      rgba(255, 255, 255, 0.10);
+@define-color border_strong       rgba(255, 255, 255, 0.16);
+
+@define-color surface_hover       rgba(255, 255, 255, 0.05);
+@define-color surface_active      rgba(255, 255, 255, 0.10);
+
+/* GTK theme variables (used by Adwaita-derived themes) */
+@define-color theme_bg_color           #0F0F11;
+@define-color theme_fg_color           #F7F7F7;
+@define-color theme_base_color         #141416;
+@define-color theme_text_color         #F7F7F7;
+@define-color theme_selected_bg_color  #FF2D2D;
+@define-color theme_selected_fg_color  #FFFFFF;
+@define-color insensitive_bg_color     #0F0F11;
+@define-color insensitive_fg_color     #4A4A4F;
+@define-color borders                  rgba(255, 255, 255, 0.06);
+@define-color unfocused_borders        rgba(255, 255, 255, 0.04);
+@define-color warning_color            #FFD60A;
+@define-color error_color              #FF2D2D;
+@define-color success_color            #30D158;
+@define-color content_view_bg          #141416;
+
+/* ─── Base / global ──────────────────────────────────────── */
+
+* {
+    font-family: "Inter", "SF Pro Display", sans-serif;
+    outline: none;
+    -gtkwidget-link-color: #ff2d2d;
+    -gtkwidget-visited-link-color: #ff6b6b;
+}
+
+window,
+dialog,
+.background {
+    background-color: @bg_base;
+    color: @fg_primary;
+}
+
+label {
+    color: @fg_primary;
+}
+
+label.dim-label,
+.dim-label {
+    color: @fg_tertiary;
+}
+
+label:disabled,
+*:disabled {
+    color: @fg_disabled;
+}
+
+/* ─── Header bars ────────────────────────────────────────── */
+
+headerbar,
+.titlebar {
+    background-color: #141416;
+    color: @fg_primary;
+    border-bottom: 1px solid @border_subtle;
+    padding: 4px 6px;
+    min-height: 38px;
+}
+
+headerbar entry,
+.titlebar entry {
+    min-height: 28px;
+}
+
+headerbar button,
+.titlebar button {
+    background: transparent;
+    border: none;
+    color: @fg_secondary;
+    padding: 4px 10px;
+    border-radius: 8px;
+}
+
+headerbar button:hover,
+.titlebar button:hover {
+    background-color: @surface_hover;
+    color: @fg_primary;
+}
+
+headerbar button:active,
+.titlebar button:active {
+    background-color: @surface_active;
+}
+
+headerbar button.suggested-action,
+.titlebar button.suggested-action {
+    background-color: @accent;
+    color: #ffffff;
+}
+
+headerbar button.suggested-action:hover {
+    background-color: @accent_hover;
+}
+
+/* Window controls (close / min / max) */
+button.titlebutton,
+headerbar button.titlebutton {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+    margin: 4px 2px;
+    border-radius: 14px;
+    background-color: @surface_hover;
+    color: @fg_tertiary;
+    border: none;
+}
+
+button.titlebutton:hover {
+    background-color: @surface_active;
+    color: @fg_primary;
+}
+
+button.titlebutton.close {
+    background-color: rgba(255, 45, 45, 0.15);
+    color: #ff6b6b;
+}
+
+button.titlebutton.close:hover {
+    background-color: @accent;
+    color: #ffffff;
+}
+
+/* ─── Buttons ────────────────────────────────────────────── */
+
+button {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid @border_subtle;
+    color: @fg_secondary;
+    border-radius: 10px;
+    padding: 6px 14px;
+    box-shadow: none;
+    text-shadow: none;
+    transition:
+        background-color 120ms ease,
+        border-color 120ms ease,
+        color 120ms ease;
+}
+
+button:hover {
+    background-color: @surface_hover;
+    border-color: @border_default;
+    color: @fg_primary;
+}
+
+button:active,
+button:checked {
+    background-color: @surface_active;
+    border-color: @border_strong;
+    color: @fg_primary;
+}
+
+button:disabled {
+    background-color: rgba(255, 255, 255, 0.02);
+    border-color: rgba(255, 255, 255, 0.03);
+    color: @fg_disabled;
+}
+
+/* Suggested / primary action */
+button.suggested-action {
+    background-color: @accent;
+    border-color: @accent;
+    color: #ffffff;
+}
+
+button.suggested-action:hover {
+    background-color: @accent_hover;
+    border-color: @accent_hover;
+}
+
+button.suggested-action:active {
+    background-color: #da1f1f;
+}
+
+/* Destructive */
+button.destructive-action {
+    background-color: transparent;
+    border-color: @accent_border;
+    color: #ff6b6b;
+}
+
+button.destructive-action:hover {
+    background-color: @accent_subtle;
+    border-color: @accent;
+    color: #ffffff;
+}
+
+/* Flat buttons (toolbar, popovers) */
+button.flat {
+    background: transparent;
+    border: none;
+}
+
+button.flat:hover {
+    background-color: @surface_hover;
+}
+
+/* Pill buttons */
+button.pill {
+    border-radius: 18px;
+    padding: 8px 16px;
+}
+
+/* Image / icon buttons */
+button.image-button {
+    padding: 6px;
+    min-width: 28px;
+    min-height: 28px;
+}
+
+/* Circular buttons */
+button.circular {
+    border-radius: 9999px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+}
+
+/* Linked buttons (e.g. nav back/forward) */
+.linked button {
+    border-radius: 0;
+}
+
+.linked button:first-child {
+    border-radius: 10px 0 0 10px;
+}
+
+.linked button:last-child {
+    border-radius: 0 10px 10px 0;
+}
+
+.linked button:not(:first-child) {
+    border-left-width: 0;
+}
+
+/* ─── Entries / search ───────────────────────────────────── */
+
+entry,
+.entry,
+spinbutton {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid @border_subtle;
+    border-radius: 10px;
+    color: @fg_primary;
+    caret-color: @accent;
+    padding: 8px 12px;
+    box-shadow: none;
+    transition:
+        border-color 120ms ease,
+        background-color 120ms ease;
+}
+
+entry:focus,
+.entry:focus,
+spinbutton:focus {
+    border-color: @accent_border;
+    background-color: rgba(255, 255, 255, 0.06);
+    outline: none;
+    box-shadow: none;
+}
+
+entry:disabled {
+    color: @fg_disabled;
+    background-color: rgba(255, 255, 255, 0.02);
+}
+
+entry selection,
+entry:focus selection {
+    background-color: @accent_subtle;
+    color: @fg_primary;
+}
+
+entry image {
+    color: @fg_tertiary;
+}
+
+entry image:hover {
+    color: @fg_primary;
+}
+
+/* Search entry */
+entry.search {
+    border-radius: 14px;
+}
+
+/* ─── Spin buttons ───────────────────────────────────────── */
+
+spinbutton button {
+    background: transparent;
+    border: none;
+    color: @fg_tertiary;
+    min-width: 18px;
+    border-radius: 6px;
+}
+
+spinbutton button:hover {
+    color: @accent;
+    background-color: @accent_subtle;
+}
+
+/* ─── Checkboxes / radio ─────────────────────────────────── */
+
+checkbutton check,
+checkbutton radio,
+treeview check,
+treeview radio {
+    min-width: 16px;
+    min-height: 16px;
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid @border_default;
+    border-radius: 4px;
+    box-shadow: none;
+    color: transparent;
+}
+
+checkbutton radio,
+treeview radio {
+    border-radius: 50%;
+}
+
+checkbutton check:hover,
+checkbutton radio:hover {
+    background-color: @surface_hover;
+    border-color: @border_strong;
+}
+
+checkbutton check:checked,
+checkbutton radio:checked,
+treeview check:checked,
+treeview radio:checked {
+    background-color: @accent;
+    border-color: @accent;
+    color: #ffffff;
+}
+
+/* ─── Switches ────────────────────────────────────────────── */
+
+switch {
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid @border_subtle;
+    border-radius: 14px;
+    color: transparent;
+    box-shadow: none;
+    min-width: 44px;
+    min-height: 22px;
+}
+
+switch:checked {
+    background-color: @accent;
+    border-color: @accent;
+}
+
+switch slider {
+    background-color: #ffffff;
+    border-radius: 50%;
+    border: none;
+    min-width: 18px;
+    min-height: 18px;
+    margin: 1px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+switch:disabled {
+    opacity: 0.5;
+}
+
+/* ─── Scrollbars — minimal Nothing style ─────────────────── */
+
+scrollbar {
+    background: transparent;
+    border: none;
+}
+
+scrollbar slider {
+    background-color: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    min-width: 6px;
+    min-height: 6px;
+    margin: 2px;
+    border: none;
+}
+
+scrollbar slider:hover {
+    background-color: rgba(255, 255, 255, 0.3);
+}
+
+scrollbar slider:active {
+    background-color: @accent;
+}
+
+scrollbar.overlay-indicator slider {
+    min-width: 4px;
+    min-height: 4px;
+}
+
+/* ─── Scales (sliders) ───────────────────────────────────── */
+
+scale trough {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    min-height: 4px;
+    min-width: 4px;
+    border: none;
+}
+
+scale highlight {
+    background-color: #ffffff;
+    border-radius: 4px;
+    border: none;
+}
+
+scale slider {
+    background-color: #ffffff;
+    border: none;
+    border-radius: 50%;
+    min-width: 14px;
+    min-height: 14px;
+    margin: -5px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+scale slider:hover {
+    background-color: @accent;
+}
+
+scale:disabled trough,
+scale:disabled highlight {
+    opacity: 0.4;
+}
+
+/* ─── Progressbars ───────────────────────────────────────── */
+
+progressbar trough {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    border: none;
+    min-height: 4px;
+}
+
+progressbar progress {
+    background-color: @accent;
+    border-radius: 4px;
+    border: none;
+}
+
+progressbar text {
+    color: @fg_tertiary;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+}
+
+/* Levelbar (audio meter, etc.) */
+levelbar block {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    border: none;
+    min-height: 4px;
+}
+
+levelbar block.filled {
+    background-color: #ffffff;
+}
+
+levelbar block.high {
+    background-color: @warning_color;
+}
+
+levelbar block.full {
+    background-color: @accent;
+}
+
+/* ─── Menus / popovers ───────────────────────────────────── */
+
+menu,
+.menu,
+popover {
+    background-color: @bg_card;
+    border: 1px solid @border_subtle;
+    border-radius: 14px;
+    padding: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    color: @fg_primary;
+}
+
+menuitem,
+popover modelbutton,
+popover button.flat {
+    background: transparent;
+    color: @fg_primary;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: none;
+}
+
+menuitem:hover,
+popover modelbutton:hover,
+popover button.flat:hover {
+    background-color: @accent_subtle;
+    color: @fg_primary;
+}
+
+menuitem:disabled {
+    color: @fg_disabled;
+}
+
+separator {
+    background-color: @border_subtle;
+    min-height: 1px;
+    margin: 4px 0;
+}
+
+/* ─── Tooltips ───────────────────────────────────────────── */
+
+tooltip {
+    background-color: @bg_card;
+    color: @fg_secondary;
+    border: 1px solid @border_subtle;
+    border-radius: 10px;
+    padding: 8px 12px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+}
+
+tooltip label {
+    color: @fg_secondary;
+    font-family: "Inter", sans-serif;
+    font-size: 11px;
+    padding: 0;
+}
+
+/* ─── Notebooks / tabs ───────────────────────────────────── */
+
+notebook {
+    background-color: @bg_base;
+}
+
+notebook header {
+    background-color: @bg_card;
+    border: none;
+}
+
+notebook header.top {
+    border-bottom: 1px solid @border_subtle;
+}
+
+notebook tab {
+    background: transparent;
+    color: @fg_tertiary;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 0;
+    box-shadow: none;
+    min-height: 28px;
+}
+
+notebook tab:hover {
+    color: @fg_primary;
+    background-color: @surface_hover;
+}
+
+notebook tab:checked {
+    color: @fg_primary;
+    background-color: transparent;
+    box-shadow: inset 0 -2px 0 @accent;
+}
+
+notebook tab button {
+    padding: 0;
+    margin: 0 0 0 6px;
+    background: transparent;
+    border: none;
+    min-width: 16px;
+    min-height: 16px;
+}
+
+notebook tab button:hover {
+    background-color: @accent_subtle;
+    border-radius: 50%;
+}
+
+/* ─── Treeview / lists ───────────────────────────────────── */
+
+treeview,
+.view,
+textview,
+textview text {
+    background-color: @bg_base;
+    color: @fg_primary;
+}
+
+treeview:selected,
+.view:selected,
+textview text selection {
+    background-color: @accent_subtle;
+    color: @fg_primary;
+}
+
+treeview:hover {
+    background-color: @surface_hover;
+}
+
+treeview header button {
+    background-color: @bg_card;
+    color: @fg_tertiary;
+    border: none;
+    border-radius: 0;
+    border-right: 1px solid @border_subtle;
+    border-bottom: 1px solid @border_subtle;
+    padding: 6px 10px;
+    font-weight: 600;
+}
+
+treeview header button:hover {
+    background-color: @surface_hover;
+    color: @fg_primary;
+}
+
+/* List rows (GtkListBox) */
+list,
+list row {
+    background-color: transparent;
+    color: @fg_primary;
+}
+
+list row {
+    padding: 4px;
+    border-radius: 8px;
+    transition: background-color 120ms ease;
+}
+
+list row:hover {
+    background-color: @surface_hover;
+}
+
+list row:selected {
+    background-color: @accent_subtle;
+    color: @fg_primary;
+}
+
+list row:selected label {
+    color: @fg_primary;
+}
+
+/* Frame / cards */
+frame {
+    border: 1px solid @border_subtle;
+    border-radius: 10px;
+    padding: 0;
+    background-color: @bg_card;
+}
+
+frame > border {
+    border-color: @border_subtle;
+}
+
+/* ─── Sidebars ───────────────────────────────────────────── */
+
+.sidebar,
+stacksidebar,
+sidebar {
+    background-color: @bg_card;
+    border-right: 1px solid @border_subtle;
+    color: @fg_secondary;
+}
+
+.sidebar row,
+stacksidebar row {
+    border-radius: 8px;
+    margin: 2px 8px;
+    padding: 8px 12px;
+    color: @fg_secondary;
+}
+
+.sidebar row:hover,
+stacksidebar row:hover {
+    background-color: @surface_hover;
+    color: @fg_primary;
+}
+
+.sidebar row:selected,
+stacksidebar row:selected {
+    background-color: @accent;
+    color: #ffffff;
+}
+
+.sidebar row:selected label {
+    color: #ffffff;
+}
+
+/* ─── Toolbars ───────────────────────────────────────────── */
+
+toolbar {
+    background-color: @bg_card;
+    border-bottom: 1px solid @border_subtle;
+    padding: 4px;
+}
+
+toolbar button {
+    background: transparent;
+    border: none;
+    padding: 6px 10px;
+    border-radius: 8px;
+}
+
+toolbar button:hover {
+    background-color: @surface_hover;
+}
+
+/* ─── Status bars ────────────────────────────────────────── */
+
+statusbar {
+    background-color: @bg_card;
+    border-top: 1px solid @border_subtle;
+    color: @fg_tertiary;
+    padding: 4px 12px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+}
+
+/* ─── Infobars / banners ─────────────────────────────────── */
+
+infobar {
+    background-color: @bg_card;
+    border: 1px solid @border_subtle;
+    border-radius: 10px;
+    padding: 10px 14px;
+    color: @fg_primary;
+}
+
+infobar.error,
+infobar.warning,
+infobar.question,
+infobar.info {
+    border-left: 3px solid @accent;
+}
+
+infobar.info {
+    border-left-color: @accent;
+}
+
+infobar.warning {
+    border-left-color: @warning_color;
+}
+
+infobar.error {
+    border-left-color: @error_color;
+}
+
+/* ─── Dialog ─────────────────────────────────────────────── */
+
+dialog {
+    background-color: @bg_base;
+    border: 1px solid @border_subtle;
+    border-radius: 14px;
+}
+
+dialog .titlebar {
+    background-color: @bg_card;
+    border-bottom: 1px solid @border_subtle;
+}
+
+dialog .dialog-action-area {
+    padding: 12px 16px;
+    border-top: 1px solid @border_subtle;
+}
+
+/* ─── Combobox ───────────────────────────────────────────── */
+
+combobox {
+    color: @fg_primary;
+}
+
+combobox arrow {
+    color: @fg_tertiary;
+    min-width: 12px;
+    min-height: 12px;
+}
+
+combobox button {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid @border_subtle;
+    border-radius: 10px;
+    padding: 6px 12px;
+}
+
+combobox window decoration {
+    background: transparent;
+}
+
+combobox window {
+    background-color: @bg_card;
+    border: 1px solid @border_subtle;
+    border-radius: 10px;
+}
+
+/* ─── Calendar ───────────────────────────────────────────── */
+
+calendar {
+    background-color: @bg_card;
+    color: @fg_primary;
+    border-radius: 10px;
+    padding: 8px;
+}
+
+calendar:selected {
+    background-color: @accent;
+    color: #ffffff;
+    border-radius: 50%;
+}
+
+calendar.header {
+    color: @fg_tertiary;
+    font-family: "JetBrains Mono", monospace;
+}
+
+calendar.button {
+    color: @fg_secondary;
+    background: transparent;
+}
+
+/* ─── Color chooser ──────────────────────────────────────── */
+
+colorswatch {
+    border-radius: 8px;
+    border: 1px solid @border_subtle;
+}
+
+colorswatch:selected {
+    border-color: @accent;
+}
+
+/* ─── File chooser ───────────────────────────────────────── */
+
+filechooser placessidebar {
+    background-color: @bg_card;
+}
+
+filechooser .view {
+    background-color: @bg_base;
+}
+
+/* ─── Misc ───────────────────────────────────────────────── */
+
+scrolledwindow undershoot,
+scrolledwindow overshoot {
+    background: none;
+    box-shadow: none;
+}
+
+scrolledwindow junction {
+    background: transparent;
+}
+
+separator.spacer {
+    background: transparent;
+}
+
+/* Selection in any text */
+selection {
+    background-color: @accent_subtle;
+    color: @fg_primary;
+}
+
+/* Links */
+link,
+*:link {
+    color: @accent;
+}
+
+link:hover,
+*:link:hover {
+    color: @accent_hover;
+}
+
+link:visited,
+*:link:visited {
+    color: #ff6b6b;
+}
+
+/* ─── App-specific overrides ─────────────────────────────── */
+
+/* Nautilus / Files */
+.nautilus-window {
+    background-color: @bg_base;
+}
+
+/* gedit / text editors */
+.gedit-document-panel {
+    background-color: @bg_card;
+}
+
+/* Spinner */
+spinner {
+    color: @accent;
+}

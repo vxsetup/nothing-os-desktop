@@ -1,0 +1,1548 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Screenshot
+Direct notify-send, fixed window corners, clean visuals.
+"""
+
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+WHITE_04 = (1.0, 1.0, 1.0, 0.04)
+
+OUTPUT_DIR = Path.home() / "Pictures" / "Screenshots"
+CARD_WIDTH = 440
+CARD_HEIGHT = 760
+LOG_FILE = Path("/tmp/nothing-screenshot.log")
+
+
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Compositor / output detection
+# ═════════════════════════════════════════════════════════════
+
+
+def detect_focused_output():
+    try:
+        r = subprocess.run(
+            ["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0 and r.stdout:
+            mons = json.loads(r.stdout)
+            for m in mons:
+                if m.get("focused"):
+                    return m.get("name")
+            if mons:
+                return mons[0].get("name")
+    except Exception as e:
+        log(f"detect_focused_output: {e}")
+    return None
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shooter — capture backend
+# ═════════════════════════════════════════════════════════════
+
+
+class Shooter:
+    @staticmethod
+    def _ts():
+        return time.strftime("%Y-%m-%d_%H-%M-%S")
+
+    @staticmethod
+    def _path():
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        return OUTPUT_DIR / f"shot_{Shooter._ts()}.png"
+
+    @staticmethod
+    def _copy(source):
+        if not shutil.which("wl-copy"):
+            return False
+        try:
+            if isinstance(source, (str, Path)):
+                with open(source, "rb") as f:
+                    data = f.read()
+            else:
+                data = source
+            p = subprocess.Popen(
+                ["wl-copy", "-t", "image/png"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            p.communicate(input=data, timeout=5)
+            return True
+        except Exception as e:
+            log(f"_copy error: {e}")
+            return False
+
+    @staticmethod
+    def shoot_full(save=True, copy=True):
+        if not shutil.which("grim"):
+            log("grim not installed")
+            return None
+
+        out = Shooter._path() if save else None
+        output = detect_focused_output()
+
+        cmd = ["grim"]
+        if output:
+            cmd += ["-o", output]
+        cmd += [str(out) if out else "-"]
+
+        log(f"shoot_full: {' '.join(cmd)}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            log(
+                f"shoot_full rc={r.returncode}, "
+                f"stderr={r.stderr.decode('utf-8', errors='replace')[:200]}"
+            )
+
+            if r.returncode != 0:
+                if output:
+                    log("retry without -o")
+                    cmd2 = ["grim", str(out) if out else "-"]
+                    r = subprocess.run(cmd2, capture_output=True, timeout=15)
+                    if r.returncode != 0:
+                        return None
+                else:
+                    return None
+
+            if copy:
+                Shooter._copy(out if out else r.stdout)
+
+            if out:
+                if out.exists() and out.stat().st_size > 0:
+                    return str(out)
+                else:
+                    log(f"output file missing or empty: {out}")
+                    return None
+            else:
+                return None
+        except subprocess.TimeoutExpired:
+            log("shoot_full timeout")
+            return None
+        except Exception as e:
+            log(f"shoot_full exception: {e}")
+            return None
+
+    @staticmethod
+    def shoot_region(save=True, copy=True):
+        if not shutil.which("grim") or not shutil.which("slurp"):
+            return None
+
+        try:
+            sel = subprocess.run(
+                ["slurp", "-c", "#FF2D2D", "-b", "#0F0F1144"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            geom = sel.stdout.strip()
+            if not geom:
+                return None
+        except Exception as e:
+            log(f"slurp error: {e}")
+            return None
+
+        out = Shooter._path() if save else None
+        cmd = ["grim", "-g", geom, str(out) if out else "-"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            if r.returncode != 0:
+                return None
+            if copy:
+                Shooter._copy(out if out else r.stdout)
+            if out and out.exists() and out.stat().st_size > 0:
+                return str(out)
+            return None
+        except Exception as e:
+            log(f"shoot_region exception: {e}")
+            return None
+
+    @staticmethod
+    def shoot_window(save=True, copy=True):
+        if not shutil.which("grim") or not shutil.which("slurp"):
+            return None
+        try:
+            r = subprocess.run(
+                ["hyprctl", "-j", "clients"], capture_output=True, text=True, timeout=3
+            )
+            if r.returncode != 0:
+                return None
+            clients = json.loads(r.stdout)
+            geoms = []
+            for c in clients:
+                if c.get("mapped") and not c.get("hidden"):
+                    x, y = c["at"]
+                    w, h = c["size"]
+                    geoms.append(f"{x},{y} {w}x{h}")
+            if not geoms:
+                return None
+            proc = subprocess.Popen(
+                ["slurp", "-r", "-c", "#FF2D2D", "-b", "#0F0F1144"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            out_str, _ = proc.communicate(input="\n".join(geoms), timeout=60)
+            geom = out_str.strip()
+            if not geom:
+                return None
+        except Exception as e:
+            log(f"window pick error: {e}")
+            return None
+
+        out = Shooter._path() if save else None
+        cmd = ["grim", "-g", geom, str(out) if out else "-"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            if r.returncode != 0:
+                return None
+            if copy:
+                Shooter._copy(out if out else r.stdout)
+            if out and out.exists() and out.stat().st_size > 0:
+                return str(out)
+            return None
+        except Exception as e:
+            log(f"shoot_window exception: {e}")
+            return None
+
+    @staticmethod
+    def latest_file():
+        if not OUTPUT_DIR.exists():
+            return None
+        try:
+            files = sorted(
+                OUTPUT_DIR.glob("shot_*.png"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if files:
+                return str(files[0])
+        except Exception:
+            pass
+        return None
+
+
+# ═════════════════════════════════════════════════════════════
+#  Direct notify-send
+# ═════════════════════════════════════════════════════════════
+
+
+def send_screenshot_notification(path, copied=False):
+    log(f"send_screenshot_notification: path={path!r}, copied={copied}")
+
+    if not shutil.which("notify-send"):
+        return
+
+    if not path:
+        try:
+            subprocess.Popen(
+                [
+                    "notify-send",
+                    "-a",
+                    "nothing-screenshot",
+                    "-i",
+                    "dialog-error",
+                    "-u",
+                    "normal",
+                    "-t",
+                    "2500",
+                    "Screenshot cancelled",
+                    "Capture did not produce a file",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            log(f"cancelled notify error: {e}")
+        return
+
+    if not os.path.exists(path):
+        log(f"path doesn't exist: {path}")
+        return
+
+    body = os.path.basename(path)
+    if copied:
+        body += "  ·  copied to clipboard"
+
+    try:
+        cmd = [
+            "notify-send",
+            "-a",
+            "nothing-screenshot",
+            "-i",
+            path,
+            "-u",
+            "normal",
+            "-t",
+            "5000",
+            "-A",
+            "open=Open",
+            "-A",
+            "folder=Folder",
+            "-A",
+            "delete=Delete",
+            "-p",
+            "Screenshot saved",
+            body,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+
+        if r.returncode != 0:
+            return
+
+        notif_id = r.stdout.strip()
+        if not notif_id:
+            return
+
+        if shutil.which("dbus-monitor"):
+            threading.Thread(
+                target=_listen_action, args=(notif_id, path), daemon=True
+            ).start()
+
+    except Exception as e:
+        log(f"notify-send exception: {e}")
+
+
+def _listen_action(notif_id, path, timeout=15):
+    try:
+        proc = subprocess.Popen(
+            [
+                "dbus-monitor",
+                "--session",
+                "interface='org.freedesktop.Notifications',member='ActionInvoked'",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if "ActionInvoked" not in line:
+                continue
+
+            nid_line = proc.stdout.readline().strip()
+            action_line = proc.stdout.readline().strip()
+
+            m_id = re.search(r"uint32\s+(\d+)", nid_line)
+            m_act = re.search(r'string\s+"([^"]+)"', action_line)
+
+            if not (m_id and m_act):
+                continue
+            if m_id.group(1) != notif_id:
+                continue
+
+            action = m_act.group(1)
+            log(f"action invoked: {action}")
+
+            if action == "open":
+                subprocess.Popen(
+                    ["xdg-open", path],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif action == "folder":
+                subprocess.Popen(
+                    ["xdg-open", os.path.dirname(path)],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif action == "delete":
+                try:
+                    os.remove(path)
+                    subprocess.Popen(
+                        [
+                            "notify-send",
+                            "-a",
+                            "nothing-screenshot",
+                            "-i",
+                            "edit-delete",
+                            "-u",
+                            "normal",
+                            "-t",
+                            "2000",
+                            "Screenshot deleted",
+                            os.path.basename(path),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    log(f"delete error: {e}")
+            break
+
+        proc.terminate()
+    except Exception as e:
+        log(f"_listen_action error: {e}")
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_full(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.40
+    round_rect(cr, cx - s, cy - s * 0.62, s * 2, s * 1.25, 2)
+    cr.stroke()
+
+
+def _draw_region(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_dash([4, 3], 0)
+    s = size * 0.38
+    cr.rectangle(cx - s, cy - s * 0.58, s * 2, s * 1.16)
+    cr.stroke()
+    cr.set_dash([], 0)
+    cm = size * 0.10
+    for dx, dy in [(-s, -s * 0.58), (s, -s * 0.58), (-s, s * 0.58), (s, s * 0.58)]:
+        cr.rectangle(cx + dx - cm / 2, cy + dy - cm / 2, cm, cm)
+        cr.fill()
+
+
+def _draw_window(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.40
+    round_rect(cr, cx - s, cy - s * 0.70, s * 2, s * 1.40, 2)
+    cr.stroke()
+    cr.move_to(cx - s, cy - s * 0.30)
+    cr.line_to(cx + s, cy - s * 0.30)
+    cr.stroke()
+    cr.arc(cx - s * 0.72, cy - s * 0.50, size * 0.05, 0, 2 * math.pi)
+    cr.fill()
+
+
+def _draw_disk(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    round_rect(cr, cx - s, cy - s, s * 2, s * 2, 2)
+    cr.stroke()
+    cr.rectangle(cx - s * 0.55, cy + s * 0.10, s * 1.10, s * 0.70)
+    cr.stroke()
+    cr.rectangle(cx - s * 0.55, cy - s * 0.85, s * 1.10, s * 0.40)
+    cr.fill()
+
+
+def _draw_clipboard(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    round_rect(cr, cx - s, cy - s * 0.85, s * 2, s * 1.70, 2)
+    cr.stroke()
+    cr.rectangle(cx - s * 0.50, cy - s * 1.05, s * 1.00, s * 0.40)
+    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a, emit=False):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+            if emit:
+                self.emit("toggled", self._active)
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  LabeledCircle
+# ═════════════════════════════════════════════════════════════
+
+
+class LabeledCircle(Gtk.Box):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, label, icon_fn, active=False, size=56):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.START)
+
+        self.circle = CircleButton(icon_fn, size=size, active=active, toggle=False)
+        self.circle.connect("clicked", lambda _c: self.emit("clicked"))
+        self.append(self.circle)
+
+        self.lbl = Gtk.Label(label=label.upper())
+        self.lbl.add_css_class("tile-label")
+        if active:
+            self.lbl.add_css_class("tile-label-active")
+        self.lbl.set_halign(Gtk.Align.CENTER)
+        self.append(self.lbl)
+
+    def set_active(self, a):
+        self.circle.set_active(a)
+        if a:
+            self.lbl.add_css_class("tile-label-active")
+        else:
+            self.lbl.remove_css_class("tile-label-active")
+
+
+# ═════════════════════════════════════════════════════════════
+#  DelayChip
+# ═════════════════════════════════════════════════════════════
+
+
+class DelayChip(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, label, active=False):
+        super().__init__()
+        self.label = label
+        self._active = active
+        self._hover = False
+        self._press = False
+        self.set_content_width(64)
+        self.set_content_height(34)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was = self._press
+        self._press = False
+        self.queue_draw()
+        if was:
+            self.emit("clicked")
+
+    def set_active(self, a):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        radius = h / 2
+        round_rect(cr, 0, 0, w, h, radius)
+        if self._active:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.fill()
+            round_rect(cr, 0.5, 0.5, w - 1, h - 1, radius)
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.stroke()
+
+        cr.select_font_face(
+            "JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD
+        )
+        cr.set_font_size(11)
+        if self._active:
+            cr.set_source_rgb(1, 1, 1)
+        elif self._hover:
+            cr.set_source_rgba(*WHITE)
+        else:
+            cr.set_source_rgba(*WHITE_85)
+        ext = cr.text_extents(self.label)
+        cr.move_to((w - ext.width) / 2 - ext.x_bearing, h / 2 + ext.height / 2 - 1)
+        cr.show_text(self.label)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hero camera
+# ═════════════════════════════════════════════════════════════
+
+
+class HeroCamera(Gtk.DrawingArea):
+    CAM = [
+        ".............",
+        "...XXX...XXX.",
+        "..XXXXXXXXXX.",
+        "..X.........X",
+        "..X..XXXXX..X",
+        "..X.XX...XX.X",
+        "..X.X..X..X.X",
+        "..X.X.XXX.X.X",
+        "..X.XX...XX.X",
+        "..X..XXXXX..X",
+        "..X.........X",
+        "..XXXXXXXXXXX",
+        ".............",
+    ]
+
+    def __init__(self, size=130):
+        super().__init__()
+        self.size = size
+        self._active = False
+        self._flash = 0.0
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+        GLib.timeout_add(40, self._tick)
+
+    def set_active(self, on):
+        if on != self._active:
+            self._active = on
+            self.queue_draw()
+
+    def trigger_flash(self):
+        self._flash = 1.0
+        self.queue_draw()
+
+    def _tick(self):
+        if self._flash > 0:
+            self._flash = max(0, self._flash - 0.05)
+            self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        rows = len(self.CAM)
+        cols = len(self.CAM[0])
+        cell = min(w, h) / max(rows, cols)
+        dot_r = cell * 0.40
+        dot_r_off = cell * 0.16
+        offset_x = (w - cols * cell) / 2 + cell / 2
+        offset_y = (h - rows * cell) / 2 + cell / 2
+
+        for r, row in enumerate(self.CAM):
+            for c, ch in enumerate(row):
+                x = offset_x + c * cell
+                y = offset_y + r * cell
+
+                if ch == "X":
+                    if self._flash > 0:
+                        intensity = self._flash
+                        rcol = RED[0] + (1.0 - RED[0]) * intensity
+                        gcol = RED[1] + (1.0 - RED[1]) * intensity
+                        bcol = RED[2] + (1.0 - RED[2]) * intensity
+                        cr.set_source_rgb(rcol, gcol, bcol)
+                    elif self._active:
+                        cr.set_source_rgb(*RED)
+                    else:
+                        cr.set_source_rgba(*WHITE_50)
+                    cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                else:
+                    cr.set_source_rgba(*WHITE_06)
+                    cr.arc(x, y, dot_r_off, 0, 2 * math.pi)
+                cr.fill()
+
+        if self._flash > 0.5:
+            alpha = (self._flash - 0.5) * 0.5
+            cr.set_source_rgba(1, 1, 1, alpha)
+            cr.arc(w / 2, h / 2, min(w, h) / 2, 0, 2 * math.pi)
+            cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  PreviewBox
+# ═════════════════════════════════════════════════════════════
+
+
+class PreviewBox(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add_css_class("preview-clean")
+        self.set_size_request(-1, 170)
+        self.set_hexpand(True)
+
+        self.picture = Gtk.Picture()
+        self.picture.set_can_shrink(True)
+        self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.picture.set_hexpand(True)
+        self.picture.set_vexpand(True)
+        self.append(self.picture)
+
+        self.placeholder = Gtk.Label(label="NO SCREENSHOTS YET")
+        self.placeholder.add_css_class("empty-label-clean")
+        self.placeholder.set_hexpand(True)
+        self.placeholder.set_vexpand(True)
+        self.placeholder.set_halign(Gtk.Align.CENTER)
+        self.placeholder.set_valign(Gtk.Align.CENTER)
+        self.append(self.placeholder)
+
+    def set_file(self, path):
+        if not path or not os.path.exists(path):
+            self.picture.set_paintable(None)
+            self.placeholder.set_visible(True)
+            self.picture.set_visible(False)
+            return
+        try:
+            f = Gio.File.new_for_path(path)
+            self.picture.set_file(f)
+            self.placeholder.set_visible(False)
+            self.picture.set_visible(True)
+        except Exception:
+            self.placeholder.set_visible(True)
+            self.picture.set_visible(False)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window — using plain Gtk.Window for clean corners
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingScreenshotWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._mode = "full"
+        self._delay = 0
+        self._busy = False
+
+        self.set_title("nothing-screenshot")
+        self.set_default_size(CARD_WIDTH, CARD_HEIGHT)
+        self.set_resizable(False)
+        self.set_decorated(False)
+        self.add_css_class("popup-window")
+        self.add_css_class("nothing-screenshot-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-screenshot")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_hexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="SCREENSHOT", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+
+        self.header_status = Gtk.Label(label="READY")
+        self.header_status.add_css_class("header-meta")
+        header.append(self.header_status)
+        card.append(header)
+
+        # Hero
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(14)
+        hero.set_margin_bottom(8)
+        self.hero = HeroCamera(size=130)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+
+        self.hero_status = Gtk.Label(label="READY")
+        self.hero_status.add_css_class("hero-date")
+        hero.append(self.hero_status)
+
+        self.elapsed_lbl = Gtk.Label(label="")
+        self.elapsed_lbl.add_css_class("hero-time-mono")
+        hero.append(self.elapsed_lbl)
+        card.append(hero)
+
+        # Divider
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(16)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # CAPTURE MODE
+        card.append(self._mk_section_hdr("CAPTURE MODE"))
+
+        modes_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        modes_row.set_margin_start(20)
+        modes_row.set_margin_end(20)
+        modes_row.set_margin_top(4)
+        modes_row.set_homogeneous(True)
+
+        self.tile_full = LabeledCircle("FULL", _draw_full, active=True)
+        self.tile_full.circle.set_active(True)
+        self.tile_full.connect("clicked", lambda *a: self._set_mode("full"))
+
+        self.tile_region = LabeledCircle("REGION", _draw_region)
+        self.tile_region.connect("clicked", lambda *a: self._set_mode("region"))
+
+        self.tile_window = LabeledCircle("WINDOW", _draw_window)
+        self.tile_window.connect("clicked", lambda *a: self._set_mode("window"))
+
+        modes_row.append(self.tile_full)
+        modes_row.append(self.tile_region)
+        modes_row.append(self.tile_window)
+        card.append(modes_row)
+
+        # DELAY
+        card.append(self._mk_section_hdr("DELAY"))
+
+        delay_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        delay_row.set_margin_start(20)
+        delay_row.set_margin_end(20)
+        delay_row.set_margin_top(4)
+        delay_row.set_halign(Gtk.Align.CENTER)
+
+        self.delay_chips = []
+        for sec, label in [(0, "NOW"), (3, "3 S"), (5, "5 S"), (10, "10 S")]:
+            chip = DelayChip(label, active=(sec == 0))
+            chip.connect("clicked", lambda c, s=sec: self._set_delay(s))
+            self.delay_chips.append((sec, chip))
+            delay_row.append(chip)
+        card.append(delay_row)
+
+        # OPTIONS — simple row: label + circle button (no left icon)
+        card.append(self._mk_section_hdr("OPTIONS"))
+
+        save_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        save_row.set_margin_start(28)
+        save_row.set_margin_end(20)
+        save_row.set_margin_top(8)
+        save_row.set_margin_bottom(8)
+        save_lbl = Gtk.Label(label="Save to disk", xalign=0)
+        save_lbl.add_css_class("adapter-label-clean")
+        save_lbl.set_hexpand(True)
+        save_row.append(save_lbl)
+        self.save_circle = CircleButton(_draw_disk, size=40, toggle=True, active=True)
+        self.save_circle.set_valign(Gtk.Align.CENTER)
+        save_row.append(self.save_circle)
+        card.append(save_row)
+
+        cb_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        cb_row.set_margin_start(28)
+        cb_row.set_margin_end(20)
+        cb_row.set_margin_top(8)
+        cb_row.set_margin_bottom(8)
+        cb_lbl = Gtk.Label(label="Copy to clipboard", xalign=0)
+        cb_lbl.add_css_class("adapter-label-clean")
+        cb_lbl.set_hexpand(True)
+        cb_row.append(cb_lbl)
+        self.cb_circle = CircleButton(
+            _draw_clipboard, size=40, toggle=True, active=True
+        )
+        self.cb_circle.set_valign(Gtk.Align.CENTER)
+        cb_row.append(self.cb_circle)
+        card.append(cb_row)
+
+        # ACTION
+        act_wrap = Gtk.Box()
+        act_wrap.set_margin_start(20)
+        act_wrap.set_margin_end(20)
+        act_wrap.set_margin_top(22)
+        self.action_btn = Gtk.Button(label="CAPTURE")
+        self.action_btn.add_css_class("shot-btn")
+        self.action_btn.set_hexpand(True)
+        self.action_btn.connect("clicked", self._on_capture)
+        act_wrap.append(self.action_btn)
+        card.append(act_wrap)
+
+        # LATEST
+        card.append(self._mk_section_hdr("LATEST"))
+
+        preview_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        preview_wrap.add_css_class("preview-wrap")
+        preview_wrap.set_margin_start(20)
+        preview_wrap.set_margin_end(20)
+
+        self.preview = PreviewBox()
+        preview_wrap.append(self.preview)
+
+        self.preview_meta_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10
+        )
+        self.preview_meta_row.set_margin_top(8)
+        self.preview_meta_row.set_margin_bottom(4)
+        self.preview_meta_row.set_margin_start(4)
+        self.preview_meta_row.set_margin_end(4)
+        self.preview_meta_name = Gtk.Label(label="", xalign=0)
+        self.preview_meta_name.add_css_class("preview-name")
+        self.preview_meta_name.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.preview_meta_name.set_hexpand(True)
+        self.preview_meta_row.append(self.preview_meta_name)
+        self.preview_meta_size = Gtk.Label(label="", xalign=1)
+        self.preview_meta_size.add_css_class("preview-meta")
+        self.preview_meta_row.append(self.preview_meta_size)
+        preview_wrap.append(self.preview_meta_row)
+
+        card.append(preview_wrap)
+
+        bottom = Gtk.Box()
+        bottom.set_size_request(-1, 28)
+        card.append(bottom)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_child(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        scroll.add_controller(wheel)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+        self._refresh_preview()
+
+    def _mk_section_hdr(self, text):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(10)
+        lbl = Gtk.Label(label=text, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _set_mode(self, mode):
+        self._mode = mode
+        self.tile_full.set_active(mode == "full")
+        self.tile_region.set_active(mode == "region")
+        self.tile_window.set_active(mode == "window")
+
+    def _set_delay(self, sec):
+        self._delay = sec
+        for s, chip in self.delay_chips:
+            chip.set_active(s == sec)
+
+    def _refresh_preview(self):
+        latest = Shooter.latest_file()
+        self.preview.set_file(latest)
+        if latest:
+            p = Path(latest)
+            self.preview_meta_name.set_text(p.name)
+            try:
+                size_b = p.stat().st_size
+                if size_b > 1024 * 1024:
+                    size_str = f"{size_b / 1024 / 1024:.1f} MB"
+                else:
+                    size_str = f"{size_b / 1024:.0f} KB"
+                self.preview_meta_size.set_text(size_str)
+            except Exception:
+                self.preview_meta_size.set_text("")
+            self.preview_meta_row.set_visible(True)
+        else:
+            self.preview_meta_row.set_visible(False)
+
+    def _on_capture(self, _b):
+        if self._busy:
+            return
+        save = self.save_circle.get_active()
+        copy = self.cb_circle.get_active()
+        mode = self._mode
+        delay = self._delay
+
+        log(f"capture requested: mode={mode}, delay={delay}, save={save}, copy={copy}")
+
+        self._busy = True
+        self.hero.set_active(True)
+        self.header_status.set_text("CAPTURING")
+        self.set_visible(False)
+
+        def countdown(remaining):
+            if remaining > 0:
+                self.hero_status.set_text("CAPTURING")
+                self.elapsed_lbl.set_text(f"{remaining}S")
+                GLib.timeout_add(1000, lambda: countdown(remaining - 1))
+                return False
+            GLib.timeout_add(150, do_shoot)
+            return False
+
+        def do_shoot():
+            def worker():
+                try:
+                    if mode == "full":
+                        path = Shooter.shoot_full(save=save, copy=copy)
+                    elif mode == "region":
+                        path = Shooter.shoot_region(save=save, copy=copy)
+                    else:
+                        path = Shooter.shoot_window(save=save, copy=copy)
+                except Exception as e:
+                    log(f"shoot worker error: {e}\n{traceback.format_exc()}")
+                    path = None
+                log(f"shoot completed: path={path!r}")
+                GLib.idle_add(self._after_shot, path, copy)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return False
+
+        if delay > 0:
+            countdown(delay)
+        else:
+            do_shoot()
+
+    def _after_shot(self, path, copied):
+        log(f"_after_shot: path={path!r}, copied={copied}")
+        self._busy = False
+        self.hero.set_active(False)
+        self.hero.trigger_flash()
+        self.elapsed_lbl.set_text("")
+
+        if path:
+            self.header_status.set_text("SAVED")
+            self.hero_status.set_text("CAPTURED")
+        else:
+            self.header_status.set_text("CANCELLED")
+            self.hero_status.set_text("CANCELLED")
+
+        GLib.timeout_add(1500, self._reset_status)
+        self._refresh_preview()
+
+        threading.Thread(
+            target=send_screenshot_notification,
+            args=(path, copied),
+            daemon=True,
+        ).start()
+        return False
+
+    def _reset_status(self):
+        self.header_status.set_text("READY")
+        self.hero_status.set_text("READY")
+        return False
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            if self._busy:
+                return True
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-screenshot")
+        self._refresh_preview()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application — plain Gtk.Application (no Adwaita decoration)
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingScreenshotApp(Gtk.Application):
+    EXTRA_CSS = """
+    /* ─── KILL Adwaita window shadow/border at root level ─── */
+    window.nothing-screenshot-window,
+    window.nothing-screenshot-window.background,
+    window.nothing-screenshot-window > * {
+        background: transparent;
+        background-color: transparent;
+        box-shadow: none;
+        border: none;
+        margin: 0;
+        padding: 0;
+    }
+    window.nothing-screenshot-window decoration,
+    window.nothing-screenshot-window > decoration,
+    window.nothing-screenshot-window decoration-overlay,
+    window.nothing-screenshot-window > decoration-overlay,
+    window.nothing-screenshot-window.csd,
+    window.nothing-screenshot-window.csd > decoration,
+    window.nothing-screenshot-window.solid-csd {
+        background: transparent;
+        background-color: transparent;
+        box-shadow: none;
+        border: none;
+        margin: 0;
+        padding: 0;
+        outline: none;
+    }
+
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .hero-time-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 18px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+        margin-top: 4px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .adapter-label-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .tile-label {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.70);
+        letter-spacing: 1.5px;
+    }
+    .tile-label-active {
+        color: #FF2D2D;
+        font-weight: 700;
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+    .shot-btn {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 4px;
+        padding: 16px 0;
+        border-radius: 28px;
+        background-color: #FF2D2D;
+        border: 1px solid #FF2D2D;
+        color: #FFFFFF;
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .shot-btn:hover {
+        background-color: #FF4747;
+        border-color: #FF4747;
+    }
+    .shot-btn:active {
+        background-color: #DA1F1F;
+    }
+    .preview-clean {
+        background-color: rgba(0, 0, 0, 0.30);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 14px;
+        overflow: hidden;
+    }
+    .preview-wrap {
+        margin-top: 4px;
+    }
+    .preview-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 12px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .preview-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 1px;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.screenshot",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("full", "F", "Quick full screen shot"),
+            ("region", "R", "Quick region shot"),
+            ("window", "W", "Quick window shot"),
+            ("daemon", "d", "Daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        # Install shared CSS first
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingScreenshotWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if "quit" in opts:
+            self.quit()
+            return 0
+
+        def quick_shot(mode):
+            def worker():
+                log(f"CLI quick_shot: mode={mode}")
+                if mode == "full":
+                    path = Shooter.shoot_full(save=True, copy=True)
+                elif mode == "region":
+                    path = Shooter.shoot_region(save=True, copy=True)
+                else:
+                    path = Shooter.shoot_window(save=True, copy=True)
+                log(f"CLI shot result: {path!r}")
+                send_screenshot_notification(path, copied=True)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        if "full" in opts:
+            quick_shot("full")
+            return 0
+        if "region" in opts:
+            quick_shot("region")
+            return 0
+        if "window" in opts:
+            quick_shot("window")
+            return 0
+        if "hide" in opts:
+            self.window.hide_popup()
+        elif "show" in opts:
+            self.window.show_popup()
+        elif "toggle" in opts:
+            self.window.toggle_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    log("=== nothing-screenshot started ===")
+    app = NothingScreenshotApp()
+    sys.exit(app.run(sys.argv))

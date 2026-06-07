@@ -1,0 +1,1698 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Volume Center
+Unified with nothing-control design language:
+  - CircleButton for all interactive elements
+  - Minimal sliders without container cards
+  - Single accent color discipline
+  - Dot-matrix hero volume display
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import math
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_notify import notify, notify_error, notify_info, notify_success
+except ImportError:
+
+    def notify(*a, **kw):
+        return None
+
+    def notify_success(*a, **kw):
+        return None
+
+    def notify_error(*a, **kw):
+        return None
+
+    def notify_info(*a, **kw):
+        return None
+
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+
+CONFIG_DIR = Path.home() / ".config" / "nothing-volume"
+DEFAULTS = {
+    "margin_top": "12",
+    "margin_right": "12",
+    "width": "380",
+    "height": "760",
+}
+
+# ═════════════════════════════════════════════════════════════
+#  Palette (matches nothing-control)
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+
+
+def log(msg):
+    print(f"[vol] {msg}", file=sys.stderr, flush=True)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Backend
+# ═════════════════════════════════════════════════════════════
+
+
+class AudioBackend:
+    @staticmethod
+    def _run(cmd, timeout=3):
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=timeout
+            ).stdout
+        except Exception:
+            return ""
+
+    @staticmethod
+    def sink_volume():
+        out = AudioBackend._run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+        m = re.findall(r"(\d+)%", out)
+        return int(sum(map(int, m)) / len(m)) if m else 0
+
+    @staticmethod
+    def source_volume():
+        out = AudioBackend._run(["pactl", "get-source-volume", "@DEFAULT_SOURCE@"])
+        m = re.findall(r"(\d+)%", out)
+        return int(sum(map(int, m)) / len(m)) if m else 0
+
+    @staticmethod
+    def sink_muted():
+        return "yes" in AudioBackend._run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"])
+
+    @staticmethod
+    def source_muted():
+        return "yes" in AudioBackend._run(
+            ["pactl", "get-source-mute", "@DEFAULT_SOURCE@"]
+        )
+
+    @staticmethod
+    def set_sink_volume(v):
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(v)}%"])
+
+    @staticmethod
+    def set_source_volume(v):
+        subprocess.run(["pactl", "set-source-volume", "@DEFAULT_SOURCE@", f"{int(v)}%"])
+
+    @staticmethod
+    def toggle_sink_mute():
+        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"])
+
+    @staticmethod
+    def toggle_source_mute():
+        subprocess.run(["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "toggle"])
+
+    @staticmethod
+    def get_default_sink():
+        return AudioBackend._run(["pactl", "get-default-sink"]).strip()
+
+    @staticmethod
+    def get_default_source():
+        return AudioBackend._run(["pactl", "get-default-source"]).strip()
+
+    @staticmethod
+    def _parse_list(kind):
+        out = AudioBackend._run(["pactl", "list", kind])
+        items, current = [], None
+        for line in out.split("\n"):
+            s = line.strip()
+            if s.startswith(f"{kind[:-1].capitalize()} #"):
+                if current and current.get("name"):
+                    items.append(current)
+                current = {"name": "", "desc": "", "id": ""}
+                m = re.search(r"#(\d+)", s)
+                if m:
+                    current["id"] = m.group(1)
+            elif current is not None:
+                if s.startswith("Name:"):
+                    current["name"] = s.split(":", 1)[1].strip()
+                elif s.startswith("Description:"):
+                    current["desc"] = s.split(":", 1)[1].strip()
+        if current and current.get("name"):
+            items.append(current)
+        return items
+
+    @staticmethod
+    def list_sinks():
+        items = AudioBackend._parse_list("sinks")
+        default = AudioBackend.get_default_sink()
+        for i in items:
+            i["default"] = i["name"] == default
+        return items
+
+    @staticmethod
+    def list_sources():
+        items = AudioBackend._parse_list("sources")
+        default = AudioBackend.get_default_source()
+        items = [i for i in items if "monitor" not in i["name"].lower()]
+        for i in items:
+            i["default"] = i["name"] == default
+        return items
+
+    @staticmethod
+    def set_default_sink(name):
+        subprocess.run(["pactl", "set-default-sink", name])
+        try:
+            inp = AudioBackend._run(["pactl", "list", "short", "sink-inputs"])
+            for line in inp.strip().split("\n"):
+                if line:
+                    subprocess.run(
+                        ["pactl", "move-sink-input", line.split("\t")[0], name]
+                    )
+        except Exception:
+            pass
+
+    @staticmethod
+    def set_default_source(name):
+        subprocess.run(["pactl", "set-default-source", name])
+
+    @staticmethod
+    def list_sink_inputs():
+        out = AudioBackend._run(["pactl", "list", "sink-inputs"])
+        items, current = [], None
+
+        def commit():
+            nonlocal current
+            if current and current.get("id") is not None:
+                name = (
+                    current.get("app_name")
+                    or current.get("media_name")
+                    or current.get("stream_name")
+                    or "Unknown"
+                )
+                current["name"] = name
+                items.append(current)
+            current = None
+
+        for line in out.split("\n"):
+            s = line.strip()
+            if s.startswith("Sink Input #"):
+                commit()
+                current = {
+                    "id": None,
+                    "volume": 0,
+                    "muted": False,
+                    "app_name": "",
+                    "media_name": "",
+                    "stream_name": "",
+                    "app_id": "",
+                }
+                m = re.search(r"#(\d+)", s)
+                if m:
+                    current["id"] = m.group(1)
+            elif current is not None:
+                if s.startswith("Volume:"):
+                    m = re.findall(r"(\d+)%", s)
+                    if m:
+                        current["volume"] = int(sum(map(int, m)) / len(m))
+                elif s.startswith("Mute:"):
+                    current["muted"] = "yes" in s.lower()
+                elif "=" in s:
+                    if s.startswith("application.name"):
+                        m = re.search(r'"([^"]+)"', s)
+                        if m:
+                            current["app_name"] = m.group(1)
+                    elif s.startswith("media.name"):
+                        m = re.search(r'"([^"]+)"', s)
+                        if m:
+                            current["media_name"] = m.group(1)
+                    elif s.startswith("application.process.binary"):
+                        m = re.search(r'"([^"]+)"', s)
+                        if m:
+                            current["app_id"] = m.group(1)
+        commit()
+        return items
+
+    @staticmethod
+    def set_sink_input_volume(input_id, percent):
+        subprocess.run(
+            ["pactl", "set-sink-input-volume", str(input_id), f"{int(percent)}%"]
+        )
+
+    @staticmethod
+    def toggle_sink_input_mute(input_id):
+        subprocess.run(["pactl", "set-sink-input-mute", str(input_id), "toggle"])
+
+
+def short_desc(desc, maxlen=32):
+    desc = re.sub(r"\s+", " ", desc).strip()
+    return desc[: maxlen - 1] + "…" if len(desc) > maxlen else desc
+
+
+def device_id(name):
+    parts = name.split(".")
+    tail = re.sub(r"[^A-Za-z0-9]", "", parts[-1] if parts else name).upper()
+    return tail[-8:] if len(tail) >= 4 else tail
+
+
+def app_short_id(app):
+    src = app.get("app_id") or app.get("app_name") or "APP"
+    tag = re.sub(r"[^A-Za-z0-9]", "", src).upper()
+    return tag[:10] if tag else "APP"
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers + color resolver
+# ═════════════════════════════════════════════════════════════
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_speaker(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.36
+    cr.move_to(cx - s, cy - s * 0.35)
+    cr.line_to(cx - s * 0.35, cy - s * 0.35)
+    cr.line_to(cx + s * 0.10, cy - s * 0.80)
+    cr.line_to(cx + s * 0.10, cy + s * 0.80)
+    cr.line_to(cx - s * 0.35, cy + s * 0.35)
+    cr.line_to(cx - s, cy + s * 0.35)
+    cr.close_path()
+    cr.fill()
+    cr.set_line_width(1.8)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.arc(cx + s * 0.10, cy, s * 0.50, -0.55, 0.55)
+    cr.stroke()
+    cr.arc(cx + s * 0.10, cy, s * 0.85, -0.55, 0.55)
+    cr.stroke()
+
+
+def _draw_speaker_muted(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE)
+    cr.set_source_rgba(*col)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.36
+    cr.move_to(cx - s, cy - s * 0.35)
+    cr.line_to(cx - s * 0.35, cy - s * 0.35)
+    cr.line_to(cx + s * 0.10, cy - s * 0.80)
+    cr.line_to(cx + s * 0.10, cy + s * 0.80)
+    cr.line_to(cx - s * 0.35, cy + s * 0.35)
+    cr.line_to(cx - s, cy + s * 0.35)
+    cr.close_path()
+    cr.fill()
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.move_to(cx + s * 0.40, cy - s * 0.55)
+    cr.line_to(cx + s * 1.05, cy + s * 0.55)
+    cr.move_to(cx + s * 1.05, cy - s * 0.55)
+    cr.line_to(cx + s * 0.40, cy + s * 0.55)
+    cr.stroke()
+
+
+def _draw_mic(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.30
+    # Mic capsule (filled)
+    round_rect(cr, cx - s * 0.55, cy - s * 1.05, s * 1.10, s * 1.30, s * 0.55)
+    cr.fill()
+    # Stand arc
+    cr.arc(cx, cy + s * 0.10, s * 0.85, 0.25, math.pi - 0.25)
+    cr.stroke()
+    # Stem
+    cr.move_to(cx, cy + s * 0.95)
+    cr.line_to(cx, cy + s * 1.30)
+    cr.stroke()
+    # Base
+    cr.move_to(cx - s * 0.50, cy + s * 1.30)
+    cr.line_to(cx + s * 0.50, cy + s * 1.30)
+    cr.stroke()
+
+
+def _draw_mic_muted(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.30
+    round_rect(cr, cx - s * 0.55, cy - s * 1.05, s * 1.10, s * 1.30, s * 0.55)
+    cr.fill()
+    cr.arc(cx, cy + s * 0.10, s * 0.85, 0.25, math.pi - 0.25)
+    cr.stroke()
+    cr.move_to(cx, cy + s * 0.95)
+    cr.line_to(cx, cy + s * 1.30)
+    cr.stroke()
+    cr.move_to(cx - s * 0.50, cy + s * 1.30)
+    cr.line_to(cx + s * 0.50, cy + s * 1.30)
+    cr.stroke()
+    # Strike-through
+    cr.set_line_width(2.4)
+    cr.move_to(cx - size * 0.42, cy - size * 0.42)
+    cr.line_to(cx + size * 0.42, cy + size * 0.42)
+    cr.stroke()
+
+
+def _draw_app(cr, cx, cy, active=False, size=22, color=None):
+    """Dot grid 3x3 — Nothing-style app glyph."""
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    d = size * 0.10
+    spacing = size * 0.22
+    for r in range(3):
+        for c in range(3):
+            x = cx + (c - 1) * spacing
+            y = cy + (r - 1) * spacing
+            cr.arc(x, y, d, 0, 2 * math.pi)
+            cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Big volume hero — dot matrix
+# ═════════════════════════════════════════════════════════════
+
+DOT_FONT = {
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
+
+
+class BigVolumeMatrix(Gtk.DrawingArea):
+    def __init__(self, height=100):
+        super().__init__()
+        self.value = 0
+        self.muted = False
+        self.set_content_width(240)
+        self.set_content_height(height)
+        self.set_draw_func(self._draw)
+
+    def set_value(self, v):
+        if v != self.value:
+            self.value = v
+            self.queue_draw()
+
+    def set_muted(self, m):
+        if m != self.muted:
+            self.muted = m
+            self.queue_draw()
+
+    def _glyphs(self):
+        if self.muted:
+            return list("--")
+        return list(str(self.value))
+
+    def _draw(self, area, cr, w, h):
+        chars = self._glyphs()
+        rows = 7
+        cell = min(h / (rows + 1.4), 12)
+        char_w = 5 * cell
+        gap = cell * 0.7
+        total_w = len(chars) * char_w + (len(chars) - 1) * gap
+        start_x = (w - total_w) / 2
+        start_y = (h - rows * cell) / 2
+        dot_r = cell * 0.42
+        dot_r_off = cell * 0.16
+
+        for ci, ch in enumerate(chars):
+            glyph = DOT_FONT.get(ch, DOT_FONT[" "])
+            gx = start_x + ci * (char_w + gap)
+            for r in range(rows):
+                for c in range(5):
+                    x = gx + c * cell + cell / 2
+                    y = start_y + r * cell + cell / 2
+                    on = glyph[r][c] == "1"
+                    if on:
+                        if self.muted:
+                            cr.set_source_rgb(*RED)
+                        else:
+                            cr.set_source_rgba(1, 1, 1, 1)
+                        cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                    else:
+                        cr.set_source_rgba(*WHITE_06)
+                        cr.arc(x, y, dot_r_off, 0, 2 * math.pi)
+                    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton — same as nothing-control
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Status dot
+# ═════════════════════════════════════════════════════════════
+
+
+class StatusDot(Gtk.DrawingArea):
+    def __init__(self, size=10):
+        super().__init__()
+        self.size = size
+        self.active = False
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_active(self, a):
+        self.active = a
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cx, cy = w / 2, h / 2
+        r = min(w, h) / 2 - 1
+        if self.active:
+            cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            cr.set_source_rgba(*WHITE_25)
+            cr.set_line_width(1.0)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Minimal slider — line + circular knob
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingSlider(Gtk.DrawingArea):
+    __gsignals__ = {
+        "value-changed": (GObject.SignalFlags.RUN_LAST, None, (int,)),
+    }
+
+    def __init__(self, value=0):
+        super().__init__()
+        self._value = value
+        self._muted = False
+        self._dragging = False
+        self._hover = False
+        self.set_content_height(28)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        motion.connect("enter", self._on_enter)
+        motion.connect("leave", self._on_leave)
+        self.add_controller(motion)
+
+        scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self._on_scroll)
+        self.add_controller(scroll)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self.queue_draw()
+
+    def _on_press(self, g, n, x, y):
+        self._dragging = True
+        self._set_from_x(x)
+
+    def _on_release(self, *a):
+        self._dragging = False
+
+    def _on_motion(self, c, x, y):
+        if self._dragging:
+            self._set_from_x(x)
+
+    def _on_scroll(self, c, dx, dy):
+        new = max(0, min(100, self._value + int(-dy * 2)))
+        if new != self._value:
+            self._value = new
+            self.queue_draw()
+            self.emit("value-changed", new)
+
+    def _set_from_x(self, x):
+        w = self.get_width()
+        if w <= 0:
+            return
+        pad = 9
+        eff_w = w - pad * 2
+        new = max(0, min(100, int(round((x - pad) / eff_w * 100))))
+        if new != self._value:
+            self._value = new
+            self.queue_draw()
+            self.emit("value-changed", new)
+
+    def set_value(self, v):
+        v = max(0, min(100, int(v)))
+        if v != self._value:
+            self._value = v
+            self.queue_draw()
+
+    def set_muted(self, m):
+        if m != self._muted:
+            self._muted = m
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        track_h = 3
+        ty = (h - track_h) / 2
+        pad = 9
+        track_x = pad
+        track_w = w - pad * 2
+
+        round_rect(cr, track_x, ty, track_w, track_h, track_h / 2)
+        cr.set_source_rgba(*WHITE_08)
+        cr.fill()
+
+        fill_w = track_w * (self._value / 100)
+        if fill_w > 0:
+            round_rect(cr, track_x, ty, fill_w, track_h, track_h / 2)
+            if self._muted:
+                cr.set_source_rgba(*WHITE_25)
+            else:
+                cr.set_source_rgba(1, 1, 1, 1.0)
+            cr.fill()
+
+        knob_r = 7 if not self._dragging else 8
+        kx = track_x + fill_w
+        ky = h / 2
+
+        cr.set_source_rgba(0, 0, 0, 0.30)
+        cr.arc(kx, ky + 1, knob_r, 0, 2 * math.pi)
+        cr.fill()
+
+        if self._muted:
+            cr.set_source_rgba(*WHITE_50)
+        else:
+            cr.set_source_rgb(1, 1, 1)
+        cr.arc(kx, ky, knob_r, 0, 2 * math.pi)
+        cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Slider row — circle icon + slider + value
+# ═════════════════════════════════════════════════════════════
+
+
+class SliderRow(Gtk.Box):
+    __gsignals__ = {
+        "value-changed": (GObject.SignalFlags.RUN_LAST, None, (int,)),
+        "icon-clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, icon_fn, icon_muted_fn, value=0, muted=False):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.set_margin_top(4)
+        self.set_margin_bottom(4)
+        self.set_margin_start(28)
+        self.set_margin_end(28)
+        self._muted = muted
+        self._icon_fn = icon_fn
+        self._icon_muted_fn = icon_muted_fn
+
+        def _icon_proxy(cr, cx, cy, active, size, color=None):
+            if self._muted:
+                self._icon_muted_fn(cr, cx, cy, False, size, color=color)
+            else:
+                self._icon_fn(cr, cx, cy, False, size, color=color)
+
+        self.icon_btn = CircleButton(_icon_proxy, size=36, toggle=False, active=muted)
+        self.icon_btn.set_valign(Gtk.Align.CENTER)
+        self.icon_btn.connect("clicked", lambda _c: self.emit("icon-clicked"))
+        self.append(self.icon_btn)
+
+        self.slider = NothingSlider(value)
+        self.slider.set_valign(Gtk.Align.CENTER)
+        self.slider.set_muted(muted)
+        self.slider.connect(
+            "value-changed", lambda _s, v: self.emit("value-changed", v)
+        )
+        self.append(self.slider)
+
+        self.value_lbl = Gtk.Label(label=f"{value}")
+        self.value_lbl.add_css_class("slider-val-mono")
+        self.value_lbl.set_valign(Gtk.Align.CENTER)
+        self.append(self.value_lbl)
+
+    def set_value(self, v):
+        self.slider.set_value(v)
+        self.value_lbl.set_text(f"{v}")
+
+    def set_muted(self, m):
+        self._muted = m
+        self.slider.set_muted(m)
+        self.icon_btn.set_active(m)
+        self.icon_btn.queue_draw()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Device row — clickable to set as default
+# ═════════════════════════════════════════════════════════════
+
+
+class AudioDeviceRow(Gtk.Button):
+    def __init__(self, dev, on_select):
+        super().__init__()
+        self.dev = dev
+        self.on_select = on_select
+        self.add_css_class("list-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        box.set_margin_top(2)
+        box.set_margin_bottom(2)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+
+        self.dot = StatusDot(size=8)
+        self.dot.set_valign(Gtk.Align.CENTER)
+        box.append(self.dot)
+
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        self.name_lbl = Gtk.Label(label=short_desc(dev["desc"]), xalign=0)
+        self.name_lbl.add_css_class("row-name")
+        self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        info.append(self.name_lbl)
+
+        sub_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.id_lbl = Gtk.Label(label=device_id(dev["name"]), xalign=0)
+        self.id_lbl.add_css_class("row-mac")
+        sub_row.append(self.id_lbl)
+
+        self.status_lbl = Gtk.Label(xalign=0)
+        self.status_lbl.add_css_class("row-status")
+        sub_row.append(self.status_lbl)
+        info.append(sub_row)
+
+        box.append(info)
+
+        self.right_lbl = Gtk.Label()
+        self.right_lbl.add_css_class("row-action")
+        self.right_lbl.set_valign(Gtk.Align.CENTER)
+        box.append(self.right_lbl)
+
+        self.set_child(box)
+        self.connect("clicked", lambda b: self.on_select(self.dev))
+        self.refresh(dev["default"])
+
+    def refresh(self, is_default):
+        self.dot.set_active(is_default)
+        if is_default:
+            self.add_css_class("active")
+            self.status_lbl.set_text("· ACTIVE")
+            self.right_lbl.set_text("●")
+        else:
+            self.remove_css_class("active")
+            self.status_lbl.set_text("· AVAILABLE")
+            self.right_lbl.set_text("SELECT")
+
+
+# ═════════════════════════════════════════════════════════════
+#  App mixer row — minimal, no card
+# ═════════════════════════════════════════════════════════════
+
+
+class AppMixerRow(Gtk.Box):
+    def __init__(self, app, on_volume, on_mute):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.app = app
+        self.on_volume = on_volume
+        self.on_mute = on_mute
+        self._updating = False
+        self.set_margin_top(10)
+        self.set_margin_bottom(10)
+        self.set_margin_start(28)
+        self.set_margin_end(28)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+
+        self.name_lbl = Gtk.Label(label=short_desc(app["name"], 28), xalign=0)
+        self.name_lbl.add_css_class("row-name")
+        self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.name_lbl.set_hexpand(True)
+        head.append(self.name_lbl)
+
+        self.tag_lbl = Gtk.Label(label=app_short_id(app), xalign=1)
+        self.tag_lbl.add_css_class("row-mac")
+        head.append(self.tag_lbl)
+
+        self.append(head)
+
+        slider_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        slider_row.set_margin_top(6)
+
+        def _app_icon(cr, cx, cy, active, size, color=None):
+            _draw_app(cr, cx, cy, False, size, color=color)
+
+        self.mute_btn = CircleButton(
+            _app_icon, size=32, toggle=False, active=app["muted"]
+        )
+        self.mute_btn.set_valign(Gtk.Align.CENTER)
+        self.mute_btn.connect("clicked", lambda _c: self.on_mute(app["id"]))
+        slider_row.append(self.mute_btn)
+
+        self.slider = NothingSlider(app["volume"])
+        self.slider.set_muted(app["muted"])
+        self.slider.set_valign(Gtk.Align.CENTER)
+        self.slider.connect("value-changed", self._on_slider)
+        slider_row.append(self.slider)
+
+        self.val_lbl = Gtk.Label(label=f"{app['volume']}", xalign=1)
+        self.val_lbl.add_css_class("slider-val-mono")
+        self.val_lbl.set_valign(Gtk.Align.CENTER)
+        slider_row.append(self.val_lbl)
+
+        self.append(slider_row)
+
+    def update(self, app):
+        self._updating = True
+        self.app = app
+        self.name_lbl.set_text(short_desc(app["name"], 28))
+        self.tag_lbl.set_text(app_short_id(app))
+        self.val_lbl.set_text(f"{app['volume']}")
+        self.slider.set_value(app["volume"])
+        self.slider.set_muted(app["muted"])
+        self.mute_btn.set_active(app["muted"])
+        self._updating = False
+
+    def _on_slider(self, _s, v):
+        if self._updating:
+            return
+        self.val_lbl.set_text(f"{v}")
+        self.on_volume(self.app["id"], v)
+
+
+# ═════════════════════════════════════════════════════════════
+#  VolumeSection — output/input with slider + device list
+# ═════════════════════════════════════════════════════════════
+
+
+class VolumeSection(Gtk.Box):
+    on_volume = None
+    on_mute = None
+    on_default = None
+
+    def __init__(self, title, kind):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.kind = kind
+        self._updating = False
+        self._dev_cache = {}
+
+        # Section header
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        header_row.set_margin_start(28)
+        header_row.set_margin_end(28)
+        header_row.set_margin_top(8)
+        header_row.set_margin_bottom(10)
+        hdr = Gtk.Label(label=title, xalign=0)
+        hdr.add_css_class("section-header-clean")
+        hdr.set_hexpand(True)
+        header_row.append(hdr)
+        self.append(header_row)
+
+        # Slider row — no card
+        if kind == "output":
+            icon_fn = _draw_speaker
+            icon_muted_fn = _draw_speaker_muted
+        else:
+            icon_fn = _draw_mic
+            icon_muted_fn = _draw_mic_muted
+
+        self.slider_row = SliderRow(icon_fn, icon_muted_fn)
+        self.slider_row.connect("value-changed", self._on_slider)
+        self.slider_row.connect("icon-clicked", self._on_mute_clicked)
+        self.append(self.slider_row)
+
+        # Devices subheader
+        dev_hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        dev_hdr_row.set_margin_start(28)
+        dev_hdr_row.set_margin_end(28)
+        dev_hdr_row.set_margin_top(16)
+        dev_hdr_row.set_margin_bottom(6)
+        dev_hdr = Gtk.Label(label="DEVICES", xalign=0)
+        dev_hdr.add_css_class("section-subheader-clean")
+        dev_hdr.set_hexpand(True)
+        dev_hdr_row.append(dev_hdr)
+        self.dev_counter = Gtk.Label(label="")
+        self.dev_counter.add_css_class("section-counter-mono")
+        dev_hdr_row.append(self.dev_counter)
+        self.append(dev_hdr_row)
+
+        # Device list — inline, no card
+        self.dev_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.dev_box.set_margin_start(20)
+        self.dev_box.set_margin_end(20)
+        self.append(self.dev_box)
+
+        self.empty_lbl = Gtk.Label(label="NO DEVICES")
+        self.empty_lbl.add_css_class("empty-label-clean")
+        self.empty_lbl.set_margin_top(14)
+        self.empty_lbl.set_margin_bottom(14)
+        self.append(self.empty_lbl)
+
+    def apply_state(self, vol, muted, devices, default_name):
+        self._updating = True
+        self.slider_row.set_value(vol)
+        self.slider_row.set_muted(muted)
+        self.dev_counter.set_text(str(len(devices)) if devices else "")
+
+        new_names = {d["name"] for d in devices}
+        for name in list(self._dev_cache.keys()):
+            if name not in new_names:
+                del self._dev_cache[name]
+
+        while child := self.dev_box.get_first_child():
+            self.dev_box.remove(child)
+
+        if not devices:
+            self.empty_lbl.set_visible(True)
+        else:
+            self.empty_lbl.set_visible(False)
+            for i, dev in enumerate(devices):
+                if dev["name"] in self._dev_cache:
+                    row = self._dev_cache[dev["name"]]
+                    row.dev = dev
+                    row.refresh(dev["default"])
+                else:
+                    row = AudioDeviceRow(dev, self._on_dev_select)
+                    self._dev_cache[dev["name"]] = row
+                self.dev_box.append(row)
+                if i < len(devices) - 1:
+                    div = Gtk.Box()
+                    div.add_css_class("row-divider-inline")
+                    div.set_margin_start(20)
+                    div.set_margin_end(8)
+                    div.set_size_request(-1, 1)
+                    self.dev_box.append(div)
+        self._updating = False
+
+    def _on_slider(self, _row, v):
+        if self._updating:
+            return
+        if self.on_volume:
+            self.on_volume(self.kind, v)
+
+    def _on_mute_clicked(self, _row):
+        if self._updating:
+            return
+        if self.on_mute:
+            self.on_mute(self.kind)
+
+    def _on_dev_select(self, dev):
+        if self.on_default:
+            self.on_default(self.kind, dev["name"], dev["desc"])
+
+
+# ═════════════════════════════════════════════════════════════
+#  AppsSection
+# ═════════════════════════════════════════════════════════════
+
+
+class AppsSection(Gtk.Box):
+    on_app_volume = None
+    on_app_mute = None
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._row_cache = {}
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        header_row.set_margin_start(28)
+        header_row.set_margin_end(28)
+        header_row.set_margin_top(8)
+        header_row.set_margin_bottom(6)
+        hdr = Gtk.Label(label="APPS", xalign=0)
+        hdr.add_css_class("section-header-clean")
+        hdr.set_hexpand(True)
+        header_row.append(hdr)
+        self.counter = Gtk.Label(label="")
+        self.counter.add_css_class("section-counter-mono")
+        header_row.append(self.counter)
+        self.append(header_row)
+
+        self.list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.append(self.list_box)
+
+        self.empty_lbl = Gtk.Label(label="NO ACTIVE APPS")
+        self.empty_lbl.add_css_class("empty-label-clean")
+        self.empty_lbl.set_margin_top(14)
+        self.empty_lbl.set_margin_bottom(14)
+        self.append(self.empty_lbl)
+
+    def apply_state(self, apps):
+        self.counter.set_text(str(len(apps)) if apps else "")
+        new_ids = {a["id"] for a in apps}
+        for aid in list(self._row_cache.keys()):
+            if aid not in new_ids:
+                self._row_cache.pop(aid)
+
+        while child := self.list_box.get_first_child():
+            self.list_box.remove(child)
+
+        if not apps:
+            self.empty_lbl.set_visible(True)
+            return
+
+        self.empty_lbl.set_visible(False)
+        for i, app in enumerate(apps):
+            aid = app["id"]
+            if aid in self._row_cache:
+                row = self._row_cache[aid]
+                row.update(app)
+            else:
+                row = AppMixerRow(
+                    app, on_volume=self._dispatch_volume, on_mute=self._dispatch_mute
+                )
+                self._row_cache[aid] = row
+            self.list_box.append(row)
+            if i < len(apps) - 1:
+                div = Gtk.Box()
+                div.add_css_class("row-divider-inline")
+                div.set_margin_start(28)
+                div.set_margin_end(28)
+                div.set_size_request(-1, 1)
+                self.list_box.append(div)
+
+    def _dispatch_volume(self, app_id, v):
+        if self.on_app_volume:
+            self.on_app_volume(app_id, v)
+
+    def _dispatch_mute(self, app_id):
+        if self.on_app_mute:
+            self.on_app_mute(app_id)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingVolumeWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self.cfg = DEFAULTS
+        self._refresh_pending = False
+
+        self.set_title("nothing-volume")
+        self.set_default_size(int(self.cfg["width"]), int(self.cfg["height"]))
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-volume")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(
+                self, LayerShell.Edge.TOP, int(self.cfg["margin_top"])
+            )
+            LayerShell.set_margin(
+                self, LayerShell.Edge.RIGHT, int(self.cfg["margin_right"])
+            )
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="VOLUME", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+        self.hero_status_top = Gtk.Label(label="")
+        self.hero_status_top.add_css_class("header-meta")
+        header.append(self.hero_status_top)
+        card.append(header)
+
+        # ─── Hero volume ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(22)
+        hero.set_margin_bottom(8)
+        self.hero = BigVolumeMatrix(height=100)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+        self.hero_status = Gtk.Label(label="—")
+        self.hero_status.add_css_class("hero-date")
+        hero.append(self.hero_status)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(20)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── OUTPUT ───
+        self.output = VolumeSection("OUTPUT", kind="output")
+        self.output.on_volume = self._on_volume
+        self.output.on_mute = self._on_mute
+        self.output.on_default = self._on_default
+        card.append(self.output)
+
+        gap1 = Gtk.Box()
+        gap1.set_size_request(-1, 8)
+        card.append(gap1)
+
+        # ─── APPS ───
+        self.apps = AppsSection()
+        self.apps.on_app_volume = self._on_app_volume
+        self.apps.on_app_mute = self._on_app_mute
+        card.append(self.apps)
+
+        gap2 = Gtk.Box()
+        gap2.set_size_request(-1, 8)
+        card.append(gap2)
+
+        # ─── INPUT ───
+        self.input = VolumeSection("INPUT", kind="input")
+        self.input.on_volume = self._on_volume
+        self.input.on_mute = self._on_mute
+        self.input.on_default = self._on_default
+        card.append(self.input)
+
+        bottom_spacer = Gtk.Box()
+        bottom_spacer.set_size_request(-1, 28)
+        card.append(bottom_spacer)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        self._kick_refresh()
+        self._refresh_timer = GLib.timeout_add(1500, self._auto_refresh)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def worker():
+            try:
+                state = {
+                    "out_vol": AudioBackend.sink_volume(),
+                    "out_muted": AudioBackend.sink_muted(),
+                    "in_vol": AudioBackend.source_volume(),
+                    "in_muted": AudioBackend.source_muted(),
+                    "sinks": AudioBackend.list_sinks(),
+                    "sources": AudioBackend.list_sources(),
+                    "def_sink": AudioBackend.get_default_sink(),
+                    "def_src": AudioBackend.get_default_source(),
+                    "apps": AudioBackend.list_sink_inputs(),
+                }
+            except Exception as e:
+                log(f"refresh: {e}")
+                state = None
+            GLib.idle_add(self._apply, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, state):
+        self._refresh_pending = False
+        if not state:
+            return False
+
+        self.hero.set_value(state["out_vol"])
+        self.hero.set_muted(state["out_muted"])
+        if state["out_muted"]:
+            self.hero_status.set_text("MUTED · OUTPUT")
+            self.hero_status_top.set_text("MUTE")
+        else:
+            self.hero_status.set_text("OUTPUT VOLUME")
+            self.hero_status_top.set_text(f"{state['out_vol']}%")
+
+        self.output.apply_state(
+            state["out_vol"], state["out_muted"], state["sinks"], state["def_sink"]
+        )
+        self.input.apply_state(
+            state["in_vol"], state["in_muted"], state["sources"], state["def_src"]
+        )
+        self.apps.apply_state(state["apps"])
+        return False
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    def _on_volume(self, kind, v):
+        def worker():
+            try:
+                if kind == "output":
+                    AudioBackend.set_sink_volume(v)
+                else:
+                    AudioBackend.set_source_volume(v)
+            except Exception as e:
+                log(f"set: {e}")
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_mute(self, kind):
+        def worker():
+            try:
+                if kind == "output":
+                    AudioBackend.toggle_sink_mute()
+                    muted = AudioBackend.sink_muted()
+                    notify_info(
+                        "Output muted" if muted else "Output unmuted",
+                        app="nothing-volume",
+                        icon=("audio-volume-muted" if muted else "audio-volume-high"),
+                        timeout=1500,
+                    )
+                else:
+                    AudioBackend.toggle_source_mute()
+                    muted = AudioBackend.source_muted()
+                    notify_info(
+                        "Mic muted" if muted else "Mic unmuted",
+                        app="nothing-volume",
+                        icon=(
+                            "microphone-sensitivity-muted"
+                            if muted
+                            else "audio-input-microphone"
+                        ),
+                        timeout=1500,
+                    )
+            except Exception as e:
+                log(f"mute: {e}")
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_default(self, kind, name, desc):
+        def worker():
+            try:
+                if kind == "output":
+                    AudioBackend.set_default_sink(name)
+                    icon = "audio-speakers"
+                    label = "Output device"
+                else:
+                    AudioBackend.set_default_source(name)
+                    icon = "audio-input-microphone"
+                    label = "Input device"
+                notify_success(
+                    f"{label} changed",
+                    short_desc(desc, 40),
+                    app="nothing-volume",
+                    icon=icon,
+                )
+            except Exception as e:
+                log(f"default: {e}")
+                notify_error(f"{kind} switch failed", str(e), app="nothing-volume")
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_app_volume(self, app_id, v):
+        def worker():
+            try:
+                AudioBackend.set_sink_input_volume(app_id, v)
+            except Exception as e:
+                log(f"app vol: {e}")
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_app_mute(self, app_id):
+        def worker():
+            try:
+                AudioBackend.toggle_sink_input_mute(app_id)
+            except Exception as e:
+                log(f"app mute: {e}")
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_key(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-volume")
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingVolumeApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.55);
+        letter-spacing: 2.5px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .section-subheader-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.30);
+        letter-spacing: 2px;
+    }
+    .section-counter-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 1px;
+    }
+    .slider-val-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.75);
+        letter-spacing: 0.5px;
+        min-width: 32px;
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+
+    /* List row (device) — flat, no internal bg */
+    .list-row {
+        background: transparent;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 12px;
+        min-height: 0;
+        box-shadow: none;
+        transition: background 120ms ease;
+    }
+    .list-row:hover {
+        background: rgba(255, 255, 255, 0.04);
+    }
+    .list-row.active {
+        background: rgba(255, 45, 45, 0.06);
+    }
+    .list-row.active:hover {
+        background: rgba(255, 45, 45, 0.10);
+    }
+
+    /* Row text styles override (override shared if needed) */
+    .row-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .row-mac {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.30);
+        letter-spacing: 1px;
+    }
+    .row-status {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.50);
+        letter-spacing: 1.5px;
+    }
+    .list-row.active .row-status {
+        color: #FF2D2D;
+    }
+    .row-action {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1.5px;
+    }
+    .list-row:hover .row-action {
+        color: #FFFFFF;
+    }
+    .list-row.active .row-action {
+        color: #FF2D2D;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.volume",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("daemon", "d", "Run as daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingVolumeWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if "quit" in opts:
+            self.quit()
+            return 0
+        if "hide" in opts:
+            self.window.hide_popup()
+        elif "toggle" in opts:
+            self.window.toggle_popup()
+        elif "show" in opts:
+            self.window.show_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingVolumeApp()
+    sys.exit(app.run(sys.argv))

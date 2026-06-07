@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — About
+System info panel unified with control/volume/network/etc.
+  - red glyph dot in header
+  - dot-matrix Nothing logo as hero
+  - flat section list with usage bars
+  - mono everywhere for technical data
+"""
+
+import os
+import sys
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        '/usr/lib/libgtk4-layer-shell.so',
+        '/usr/lib/libgtk4-layer-shell.so.0',
+        '/usr/lib64/libgtk4-layer-shell.so',
+        '/usr/lib64/libgtk4-layer-shell.so.0',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0',
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get('LD_PRELOAD', '')
+    if lib_path in current:
+        return
+    os.environ['LD_PRELOAD'] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+try:
+    gi.require_version('Gtk4LayerShell', '1.0')
+    from gi.repository import Gtk4LayerShell as LayerShell
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, Pango, GObject
+import cairo
+import subprocess
+import re
+import math
+import time
+import platform
+import socket
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / '.local/lib/nothing-os'))
+from nothing_style import install_css, fade_in, fade_out
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+    def close_other_popups(*a, **kw): pass
+
+
+RED       = (1.000, 0.176, 0.176)
+WHITE     = (1.0, 1.0, 1.0, 1.0)
+WHITE_95  = (1.0, 1.0, 1.0, 0.95)
+WHITE_85  = (1.0, 1.0, 1.0, 0.85)
+WHITE_70  = (1.0, 1.0, 1.0, 0.70)
+WHITE_50  = (1.0, 1.0, 1.0, 0.50)
+WHITE_25  = (1.0, 1.0, 1.0, 0.25)
+WHITE_12  = (1.0, 1.0, 1.0, 0.12)
+WHITE_08  = (1.0, 1.0, 1.0, 0.08)
+WHITE_06  = (1.0, 1.0, 1.0, 0.06)
+
+WARN_YELLOW = (0.95, 0.62, 0.18, 1.0)
+
+CARD_WIDTH  = 420
+CARD_HEIGHT = 760
+
+
+def _run(cmd, timeout=2):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              check=False, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+# ═════════════════════════════════════════════════════════════
+#  System info collectors
+# ═════════════════════════════════════════════════════════════
+
+class SysInfo:
+    @staticmethod
+    def hostname():
+        try: return socket.gethostname()
+        except: return 'unknown'
+
+    @staticmethod
+    def user():
+        return os.getenv('USER', 'user')
+
+    @staticmethod
+    def os_name():
+        try:
+            with open('/etc/os-release') as f:
+                for line in f:
+                    if line.startswith('PRETTY_NAME='):
+                        return line.split('=', 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return platform.system()
+
+    @staticmethod
+    def kernel():
+        try: return platform.release()
+        except: return 'unknown'
+
+    @staticmethod
+    def arch():
+        return platform.machine()
+
+    @staticmethod
+    def uptime():
+        try:
+            with open('/proc/uptime') as f:
+                secs = int(float(f.read().split()[0]))
+            d, secs = divmod(secs, 86400)
+            h, secs = divmod(secs, 3600)
+            m, _ = divmod(secs, 60)
+            parts = []
+            if d: parts.append(f'{d}d')
+            if h: parts.append(f'{h}h')
+            parts.append(f'{m}m')
+            return ' '.join(parts)
+        except Exception:
+            return '—'
+
+    @staticmethod
+    def cpu_model():
+        try:
+            with open('/proc/cpuinfo') as f:
+                for line in f:
+                    if line.startswith('model name'):
+                        name = line.split(':', 1)[1].strip()
+                        name = re.sub(r'\(R\)|\(TM\)|CPU\s+', '', name)
+                        name = re.sub(r'\s+@\s+.*', '', name)
+                        return name.strip()
+        except Exception:
+            pass
+        return platform.processor() or 'CPU'
+
+    @staticmethod
+    def cpu_cores():
+        try: return os.cpu_count() or 0
+        except: return 0
+
+    @staticmethod
+    def cpu_freq():
+        try:
+            with open('/proc/cpuinfo') as f:
+                for line in f:
+                    if line.startswith('cpu MHz'):
+                        mhz = float(line.split(':', 1)[1].strip())
+                        return f'{mhz / 1000:.2f} GHz'
+        except Exception:
+            pass
+        return ''
+
+    @staticmethod
+    def cpu_load():
+        try:
+            with open('/proc/loadavg') as f:
+                load1 = float(f.read().split()[0])
+            cores = os.cpu_count() or 1
+            return min(100, int(load1 / cores * 100))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def gpu_model():
+        out = _run(['lspci', '-mm'])
+        for line in out.split('\n'):
+            if 'VGA' in line or '3D' in line or 'Display' in line:
+                m = re.findall(r'"([^"]+)"', line)
+                if len(m) >= 3:
+                    vendor = m[2].split(' ')[0]
+                    model = m[3] if len(m) > 3 else ''
+                    return f'{vendor} {model}'.strip()[:48]
+        return '—'
+
+    @staticmethod
+    def memory():
+        try:
+            mem = {}
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        val = int(parts[1].strip().split()[0])
+                        mem[key] = val
+            total = mem.get('MemTotal', 0)
+            available = mem.get('MemAvailable', mem.get('MemFree', 0))
+            used = total - available
+            total_gb = total / 1024 / 1024
+            used_gb = used / 1024 / 1024
+            pct = int(used / total * 100) if total else 0
+            return (used_gb, total_gb, pct)
+        except Exception:
+            return (0, 0, 0)
+
+    @staticmethod
+    def disk_root():
+        try:
+            st = os.statvfs('/')
+            total = st.f_blocks * st.f_frsize
+            free = st.f_bavail * st.f_frsize
+            used = total - free
+            total_gb = total / 1024 / 1024 / 1024
+            used_gb = used / 1024 / 1024 / 1024
+            pct = int(used / total * 100) if total else 0
+            return (used_gb, total_gb, pct)
+        except Exception:
+            return (0, 0, 0)
+
+    @staticmethod
+    def battery():
+        bat_dir = Path('/sys/class/power_supply')
+        if not bat_dir.exists():
+            return (None, None)
+        for d in bat_dir.iterdir():
+            if d.name.startswith('BAT'):
+                try:
+                    cap = int((d / 'capacity').read_text().strip())
+                    status = (d / 'status').read_text().strip()
+                    return (cap, status)
+                except Exception:
+                    pass
+        return (None, None)
+
+    @staticmethod
+    def desktop_session():
+        return (os.getenv('XDG_CURRENT_DESKTOP')
+                or os.getenv('XDG_SESSION_DESKTOP')
+                or os.getenv('DESKTOP_SESSION')
+                or 'Hyprland')
+
+    @staticmethod
+    def session_type():
+        return os.getenv('XDG_SESSION_TYPE', 'wayland')
+
+    @staticmethod
+    def shell():
+        return os.path.basename(os.getenv('SHELL', '—'))
+
+    @staticmethod
+    def package_count():
+        r = subprocess.run(['pacman', '-Q'], capture_output=True,
+                           text=True, timeout=3)
+        if r.returncode == 0:
+            n = len(r.stdout.strip().split('\n'))
+            return f'{n} (pacman)'
+        r = subprocess.run(['dpkg', '-l'], capture_output=True,
+                           text=True, timeout=3)
+        if r.returncode == 0:
+            lines = [l for l in r.stdout.split('\n') if l.startswith('ii')]
+            return f'{len(lines)} (dpkg)'
+        return '—'
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hero — Nothing logo dot-matrix
+# ═════════════════════════════════════════════════════════════
+
+class HeroLogo(Gtk.DrawingArea):
+    """Nothing-inspired concentric logo as dot-matrix."""
+
+    MATRIX = [
+        ".....XXX.....",
+        "...XX...XX...",
+        "..X.......X..",
+        ".X.........X.",
+        ".X.........X.",
+        "X....XXX....X",
+        "X....XXX....X",
+        "X....XXX....X",
+        ".X.........X.",
+        ".X.........X.",
+        "..X.......X..",
+        "...XX...XX...",
+        ".....XXX.....",
+    ]
+
+    def __init__(self, size=140):
+        super().__init__()
+        self.size = size
+        self._phase = 0.0
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+        # Subtle continuous breathing
+        GLib.timeout_add(60, self._tick)
+
+    def _tick(self):
+        self._phase = (self._phase + 0.012) % 1.0
+        self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        rows = len(self.MATRIX)
+        cols = len(self.MATRIX[0])
+        cell = min(w, h) / max(rows, cols)
+        dot_r = cell * 0.42
+        dot_r_off = cell * 0.16
+        offset_x = (w - cols * cell) / 2 + cell / 2
+        offset_y = (h - rows * cell) / 2 + cell / 2
+
+        # Slow brightness pulse (breathing)
+        breath = 0.85 + 0.15 * math.sin(self._phase * 2 * math.pi)
+
+        for r, row in enumerate(self.MATRIX):
+            for c, ch in enumerate(row):
+                x = offset_x + c * cell
+                y = offset_y + r * cell
+                if ch == 'X':
+                    cr.set_source_rgba(RED[0], RED[1], RED[2], breath)
+                    cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                else:
+                    cr.set_source_rgba(*WHITE_06)
+                    cr.arc(x, y, dot_r_off, 0, 2 * math.pi)
+                cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Spec row — flat label/value
+# ═════════════════════════════════════════════════════════════
+
+class SpecRow(Gtk.Box):
+    def __init__(self, label, value='—'):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.set_margin_start(28)
+        self.set_margin_end(28)
+        self.set_margin_top(10)
+        self.set_margin_bottom(10)
+
+        self.label_lbl = Gtk.Label(label=label, xalign=0)
+        self.label_lbl.add_css_class('spec-label')
+        self.label_lbl.set_hexpand(True)
+        self.append(self.label_lbl)
+
+        self.value_lbl = Gtk.Label(label=value, xalign=1)
+        self.value_lbl.add_css_class('spec-value')
+        self.value_lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.value_lbl.set_max_width_chars(32)
+        self.append(self.value_lbl)
+
+    def set_value(self, v):
+        self.value_lbl.set_text(str(v))
+
+
+# ═════════════════════════════════════════════════════════════
+#  Usage bar — pill with adaptive color
+# ═════════════════════════════════════════════════════════════
+
+class UsageBar(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.percent = 0
+        self.set_content_height(4)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+    def set_percent(self, p):
+        if p != self.percent:
+            self.percent = max(0, min(100, p))
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        # Pill track bg
+        round_rect(cr, 0, 0, w, h, h / 2)
+        cr.set_source_rgba(*WHITE_08)
+        cr.fill()
+
+        fw = max(h, w * (self.percent / 100))
+        if self.percent <= 0:
+            return
+        round_rect(cr, 0, 0, fw, h, h / 2)
+        if self.percent >= 85:
+            cr.set_source_rgb(*RED)
+        elif self.percent >= 65:
+            cr.set_source_rgba(*WARN_YELLOW)
+        else:
+            cr.set_source_rgba(1, 1, 1, 0.92)
+        cr.fill()
+
+
+class UsageRow(Gtk.Box):
+    def __init__(self, label):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.set_margin_start(28)
+        self.set_margin_end(28)
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.label_lbl = Gtk.Label(label=label, xalign=0)
+        self.label_lbl.add_css_class('spec-label')
+        self.label_lbl.set_hexpand(True)
+        top.append(self.label_lbl)
+        self.num_lbl = Gtk.Label(label='—', xalign=1)
+        self.num_lbl.add_css_class('spec-value')
+        top.append(self.num_lbl)
+        self.append(top)
+
+        self.bar = UsageBar()
+        self.append(self.bar)
+
+    def set(self, percent, text):
+        self.bar.set_percent(percent)
+        self.num_lbl.set_text(text)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+class NothingAboutWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._refresh_pending = False
+
+        self.set_title('nothing-about')
+        self.set_default_size(CARD_WIDTH, CARD_HEIGHT)
+        self.set_resizable(False)
+        self.add_css_class('popup-window')
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, 'nothing-about')
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self,
+                                         LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class('outer-wrap')
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class('card-scroller')
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_hexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class('main-card')
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label='ABOUT', xalign=0)
+        title.add_css_class('window-title')
+        title.set_hexpand(True)
+        header.append(title)
+        self.version_lbl = Gtk.Label(label='NOTHING OS · 1.0')
+        self.version_lbl.add_css_class('header-meta')
+        header.append(self.version_lbl)
+        card.append(header)
+
+        # ─── Hero ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(16)
+        hero.set_margin_bottom(8)
+        self.hero = HeroLogo(size=140)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+        uh = SysInfo.user() + '@' + SysInfo.hostname()
+        self.user_host = Gtk.Label(label=uh.upper())
+        self.user_host.add_css_class('hero-date')
+        hero.append(self.user_host)
+        self.os_lbl = Gtk.Label(label='—')
+        self.os_lbl.add_css_class('hero-sub-mono')
+        hero.append(self.os_lbl)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(18)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── SYSTEM section ───
+        card.append(self._mk_section_hdr('SYSTEM'))
+        self.row_os       = SpecRow('OS');       card.append(self.row_os);       card.append(self._inline_div())
+        self.row_kernel   = SpecRow('Kernel');   card.append(self.row_kernel);   card.append(self._inline_div())
+        self.row_arch     = SpecRow('Arch');     card.append(self.row_arch);     card.append(self._inline_div())
+        self.row_uptime   = SpecRow('Uptime');   card.append(self.row_uptime);   card.append(self._inline_div())
+        self.row_packages = SpecRow('Packages'); card.append(self.row_packages)
+
+        # ─── SESSION section ───
+        card.append(self._mk_section_hdr('SESSION'))
+        self.row_desktop = SpecRow('Desktop'); card.append(self.row_desktop); card.append(self._inline_div())
+        self.row_session = SpecRow('Type');    card.append(self.row_session); card.append(self._inline_div())
+        self.row_shell   = SpecRow('Shell');   card.append(self.row_shell)
+
+        # ─── HARDWARE section ───
+        card.append(self._mk_section_hdr('HARDWARE'))
+        self.row_cpu   = SpecRow('CPU');   card.append(self.row_cpu);   card.append(self._inline_div())
+        self.row_cores = SpecRow('Cores'); card.append(self.row_cores); card.append(self._inline_div())
+        self.row_gpu   = SpecRow('GPU');   card.append(self.row_gpu)
+
+        # ─── USAGE section ───
+        card.append(self._mk_section_hdr('USAGE'))
+        self.usage_cpu  = UsageRow('CPU Load');  card.append(self.usage_cpu);  card.append(self._inline_div())
+        self.usage_mem  = UsageRow('Memory');    card.append(self.usage_mem);  card.append(self._inline_div())
+        self.usage_disk = UsageRow('Disk Root'); card.append(self.usage_disk)
+
+        # ─── BATTERY (optional) ───
+        self.bat_hdr = self._mk_section_hdr('BATTERY')
+        card.append(self.bat_hdr)
+        self.usage_bat = UsageRow('Level')
+        card.append(self.usage_bat)
+        self._bat_inline_div = self._inline_div()
+        card.append(self._bat_inline_div)
+        self.row_bat_status = SpecRow('Status')
+        card.append(self.row_bat_status)
+
+        bottom_spacer = Gtk.Box()
+        bottom_spacer.set_size_request(-1, 28)
+        card.append(bottom_spacer)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        wheel.connect('scroll', self._on_wheel, scroll)
+        scroll.add_controller(wheel)
+
+        self._kick_refresh()
+        GLib.timeout_add(3000, self._auto_refresh)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect('key-pressed', self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_section_hdr(self, text):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(20)
+        row.set_margin_bottom(6)
+        lbl = Gtk.Label(label=text, xalign=0)
+        lbl.add_css_class('section-header-clean')
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _inline_div(self):
+        d = Gtk.Box()
+        d.add_css_class('row-divider-inline')
+        d.set_margin_start(28)
+        d.set_margin_end(28)
+        d.set_size_request(-1, 1)
+        return d
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(),
+                  min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def worker():
+            try:
+                state = {
+                    'os':       SysInfo.os_name(),
+                    'kernel':   SysInfo.kernel(),
+                    'arch':     SysInfo.arch(),
+                    'uptime':   SysInfo.uptime(),
+                    'packages': SysInfo.package_count(),
+                    'desktop':  SysInfo.desktop_session(),
+                    'session':  SysInfo.session_type().upper(),
+                    'shell':    SysInfo.shell(),
+                    'cpu':      SysInfo.cpu_model(),
+                    'cores':    SysInfo.cpu_cores(),
+                    'cpu_freq': SysInfo.cpu_freq(),
+                    'gpu':      SysInfo.gpu_model(),
+                    'cpu_load': SysInfo.cpu_load(),
+                    'mem':      SysInfo.memory(),
+                    'disk':     SysInfo.disk_root(),
+                    'battery':  SysInfo.battery(),
+                }
+            except Exception as e:
+                print(f"[about] refresh: {e}", file=sys.stderr)
+                state = None
+            GLib.idle_add(self._apply, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, state):
+        self._refresh_pending = False
+        if not state:
+            return False
+
+        self.os_lbl.set_text(state['os'].upper())
+
+        self.row_os.set_value(state['os'])
+        self.row_kernel.set_value(state['kernel'])
+        self.row_arch.set_value(state['arch'])
+        self.row_uptime.set_value(state['uptime'])
+        self.row_packages.set_value(state['packages'])
+
+        self.row_desktop.set_value(state['desktop'])
+        self.row_session.set_value(state['session'])
+        self.row_shell.set_value(state['shell'])
+
+        self.row_cpu.set_value(state['cpu'])
+        cores_text = f"{state['cores']}"
+        if state['cpu_freq']:
+            cores_text += f" · {state['cpu_freq']}"
+        self.row_cores.set_value(cores_text)
+        self.row_gpu.set_value(state['gpu'])
+
+        self.usage_cpu.set(state['cpu_load'], f"{state['cpu_load']}%")
+        used_g, total_g, pct = state['mem']
+        self.usage_mem.set(pct, f"{used_g:.1f} / {total_g:.1f} GB")
+        used_g, total_g, pct = state['disk']
+        self.usage_disk.set(pct, f"{used_g:.0f} / {total_g:.0f} GB")
+
+        bat_pct, bat_status = state['battery']
+        if bat_pct is not None:
+            self.bat_hdr.set_visible(True)
+            self.usage_bat.set_visible(True)
+            self._bat_inline_div.set_visible(True)
+            self.row_bat_status.set_visible(True)
+            self.usage_bat.set(bat_pct, f"{bat_pct}%")
+            self.row_bat_status.set_value(bat_status)
+        else:
+            self.bat_hdr.set_visible(False)
+            self.usage_bat.set_visible(False)
+            self._bat_inline_div.set_visible(False)
+            self.row_bat_status.set_visible(False)
+        return False
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups('nothing-about')
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140,
+                 on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+class NothingAboutApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .hero-sub-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1px;
+        margin-top: 2px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .spec-label {
+        font-family: "Inter", sans-serif;
+        font-weight: 500;
+        font-size: 13px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 0.1px;
+    }
+    .spec-value {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.60);
+        letter-spacing: 0.5px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id='tech.nothing.about',
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+        )
+        self.window = None
+        for opt, short, desc in [
+            ('toggle', 't', 'Toggle popup'),
+            ('show', 's', 'Show popup'),
+            ('hide', 'h', 'Hide popup'),
+            ('daemon', 'd', 'Run as daemon'),
+            ('quit', 'q', 'Quit'),
+        ]:
+            self.add_main_option(opt, ord(short), GLib.OptionFlags.NONE,
+                                 GLib.OptionArg.NONE, desc, None)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(
+            Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingAboutWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if 'quit' in opts:
+            self.quit()
+            return 0
+        if 'hide' in opts:
+            self.window.hide_popup()
+        elif 'toggle' in opts:
+            self.window.toggle_popup()
+        elif 'show' in opts:
+            self.window.show_popup()
+        elif 'daemon' in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == '__main__':
+    app = NothingAboutApp()
+    sys.exit(app.run(sys.argv))

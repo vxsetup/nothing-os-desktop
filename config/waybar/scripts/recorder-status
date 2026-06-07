@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+if [ -f /tmp/nothing-recorder.state ]; then
+    echo '{"text":"●","class":"recording","tooltip":"REC"}'
+else
+    echo '{"text":"","class":"idle","tooltip":""}'
+fi

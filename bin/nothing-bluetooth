@@ -1,0 +1,1565 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Bluetooth
+Unified with control/volume/network design language:
+  - red glyph dot in header
+  - hero dot-matrix bluetooth icon with scanning pulse
+  - CircleButton for adapter toggle + scan action
+  - flat device rows with battery indicator
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import math
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_notify import notify, notify_error, notify_info, notify_success
+except ImportError:
+
+    def notify(*a, **kw):
+        return None
+
+    def notify_success(*a, **kw):
+        return None
+
+    def notify_error(*a, **kw):
+        return None
+
+    def notify_info(*a, **kw):
+        return None
+
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+
+CONFIG_DIR = Path.home() / ".config" / "nothing-bluetooth"
+
+DEFAULTS = {
+    "margin_top": "12",
+    "margin_right": "12",
+    "width": "380",
+    "height": "700",
+}
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+WHITE_04 = (1.0, 1.0, 1.0, 0.04)
+
+WARN_YELLOW = (0.95, 0.62, 0.18, 1.0)
+OK_GREEN = (0.30, 0.82, 0.42, 1.0)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Backend
+# ═════════════════════════════════════════════════════════════
+
+
+class BluetoothBackend:
+    @staticmethod
+    def _run(cmd, timeout=5):
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=timeout
+            ).stdout
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _bctl(*args, timeout=5):
+        return BluetoothBackend._run(["bluetoothctl"] + list(args), timeout=timeout)
+
+    @staticmethod
+    def powered():
+        out = BluetoothBackend._bctl("show")
+        m = re.search(r"Powered:\s*(yes|no)", out)
+        return bool(m and m.group(1) == "yes")
+
+    @staticmethod
+    def scanning():
+        out = BluetoothBackend._bctl("show")
+        m = re.search(r"Discovering:\s*(yes|no)", out)
+        return bool(m and m.group(1) == "yes")
+
+    @staticmethod
+    def set_power(on):
+        BluetoothBackend._bctl("power", "on" if on else "off")
+
+    @staticmethod
+    def start_scan():
+        try:
+            subprocess.Popen(
+                ["bluetoothctl", "--timeout", "15", "scan", "on"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def stop_scan():
+        BluetoothBackend._bctl("scan", "off")
+
+    @staticmethod
+    def list_all():
+        out = BluetoothBackend._bctl("devices")
+        devices = []
+        for line in out.split("\n"):
+            m = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.+)", line.strip())
+            if m:
+                devices.append({"mac": m.group(1), "name": m.group(2).strip()})
+        return devices
+
+    @staticmethod
+    def device_info(mac):
+        out = BluetoothBackend._bctl("info", mac)
+
+        def ex(p):
+            m = re.search(p, out)
+            return m.group(1).strip() if m else None
+
+        battery = None
+        bm = re.search(r"Battery Percentage:.*\((\d+)\)", out)
+        if bm:
+            battery = int(bm.group(1))
+        return {
+            "name": ex(r"Name:\s*(.+)") or "Unknown",
+            "alias": ex(r"Alias:\s*(.+)"),
+            "paired": ex(r"Paired:\s*(yes|no)") == "yes",
+            "connected": ex(r"Connected:\s*(yes|no)") == "yes",
+            "icon": ex(r"Icon:\s*(.+)") or "",
+            "battery": battery,
+        }
+
+    @staticmethod
+    def connect(mac):
+        BluetoothBackend._bctl("connect", mac, timeout=15)
+
+    @staticmethod
+    def disconnect(mac):
+        BluetoothBackend._bctl("disconnect", mac, timeout=10)
+
+    @staticmethod
+    def pair(mac):
+        BluetoothBackend._bctl("pair", mac, timeout=20)
+
+    @staticmethod
+    def trust(mac):
+        BluetoothBackend._bctl("trust", mac)
+
+    @staticmethod
+    def list_all_with_info():
+        devices = BluetoothBackend.list_all()
+        result = []
+        for d in devices:
+            info = BluetoothBackend.device_info(d["mac"])
+            result.append(
+                {
+                    "mac": d["mac"],
+                    "name": info.get("alias") or info.get("name") or d["name"],
+                    "icon": info.get("icon", ""),
+                    "paired": info.get("paired", False),
+                    "connected": info.get("connected", False),
+                    "battery": info.get("battery"),
+                }
+            )
+        result.sort(
+            key=lambda x: (not x["connected"], not x["paired"], x["name"].lower())
+        )
+        return result
+
+
+def clean_name(name):
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def short_mac(mac):
+    return mac.replace(":", "")[-6:].upper()
+
+
+def _bt_icon_for_device(icon):
+    icon = (icon or "").lower()
+    if "audio" in icon or "headset" in icon or "headphone" in icon:
+        return "audio-headphones"
+    if "phone" in icon:
+        return "phone"
+    if "computer" in icon:
+        return "computer"
+    if "input" in icon or "keyboard" in icon:
+        return "input-keyboard"
+    if "mouse" in icon:
+        return "input-mouse"
+    return "bluetooth"
+
+
+def send_bt_action_notification(device, action, success):
+    name = clean_name(device.get("name", "Device"))
+    icon = _bt_icon_for_device(device.get("icon", ""))
+
+    if not success:
+        notify_error(f"Bluetooth: {action} failed", name, app="nothing-bluetooth")
+        return
+
+    if action == "connect":
+        body = name
+        if device.get("battery") is not None:
+            body += f"  ·  battery {device['battery']}%"
+        notify(
+            "Connected",
+            body,
+            app="nothing-bluetooth",
+            icon=icon,
+            urgency="normal",
+            timeout=2500,
+        )
+    elif action == "disconnect":
+        notify(
+            "Disconnected",
+            name,
+            app="nothing-bluetooth",
+            icon=icon,
+            urgency="normal",
+            timeout=2000,
+        )
+    elif action == "pair":
+        notify_success("Paired", name, app="nothing-bluetooth", icon=icon)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_bluetooth(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.40
+    cr.move_to(cx, cy - s)
+    cr.line_to(cx + s * 0.55, cy - s * 0.35)
+    cr.line_to(cx - s * 0.55, cy + s * 0.35)
+    cr.line_to(cx, cy + s)
+    cr.line_to(cx, cy - s)
+    cr.move_to(cx, cy)
+    cr.line_to(cx + s * 0.55, cy + s * 0.35)
+    cr.line_to(cx - s * 0.55, cy - s * 0.35)
+    cr.stroke()
+
+
+def _draw_scan(cr, cx, cy, active=False, size=22, color=None):
+    """Radar / scan glyph — concentric dots."""
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    dot_r = size * 0.07
+    # Center
+    cr.arc(cx, cy, dot_r * 1.4, 0, 2 * math.pi)
+    cr.fill()
+    # Two rings of small dots
+    rings = [
+        (size * 0.20, 6),
+        (size * 0.36, 10),
+    ]
+    for radius, count in rings:
+        for i in range(count):
+            a = (i / count) * 2 * math.pi
+            x = cx + math.cos(a) * radius
+            y = cy + math.sin(a) * radius
+            cr.arc(x, y, dot_r, 0, 2 * math.pi)
+            cr.fill()
+
+
+def _draw_headphones(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.36
+    # Headband arc
+    cr.arc(cx, cy, s * 0.95, math.pi, 2 * math.pi)
+    cr.stroke()
+    # Left ear-cup
+    round_rect(cr, cx - s * 0.95, cy - s * 0.10, s * 0.40, s * 0.65, 2)
+    cr.fill()
+    # Right ear-cup
+    round_rect(cr, cx + s * 0.55, cy - s * 0.10, s * 0.40, s * 0.65, 2)
+    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton (shared)
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a, emit=False):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+            if emit:
+                self.emit("toggled", self._active)
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  ScanButton — pulsing animation when scanning
+# ═════════════════════════════════════════════════════════════
+
+
+class ScanButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, size=40):
+        super().__init__()
+        self._size = size
+        self._scanning = False
+        self._enabled = False
+        self._hover = False
+        self._press = False
+        self._phase = 0.0
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+        GLib.timeout_add(50, self._tick)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was = self._press
+        self._press = False
+        if was and self._enabled:
+            self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        if self._scanning:
+            self._phase = (self._phase + 0.04) % 1.0
+            self.queue_draw()
+        return True
+
+    def set_scanning(self, on):
+        if on != self._scanning:
+            self._scanning = on
+            self.queue_draw()
+
+    def set_enabled(self, on):
+        if on != self._enabled:
+            self._enabled = on
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        # Background
+        if self._scanning:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press and self._enabled:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover and self._enabled:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        # Icon
+        if self._scanning:
+            color = WHITE
+        elif self._enabled:
+            color = (1.0, 1.0, 1.0, 0.92)
+        else:
+            color = (1.0, 1.0, 1.0, 0.35)
+        _draw_scan(cr, cx, cy, False, int(self._size * 0.50), color=color)
+
+        # Pulsing ring when scanning
+        if self._scanning:
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            pulse_r = r + 2 + (1.0 - self._phase) * 6
+            alpha = self._phase
+            cr.set_source_rgba(1, 1, 1, alpha * 0.9)
+            cr.arc(cx, cy, pulse_r, 0, 2 * math.pi)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  StatusDot
+# ═════════════════════════════════════════════════════════════
+
+
+class StatusDot(Gtk.DrawingArea):
+    def __init__(self, size=10):
+        super().__init__()
+        self.active = False
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_active(self, a):
+        self.active = a
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cx, cy = w / 2, h / 2
+        r = min(w, h) / 2 - 1
+        if self.active:
+            cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            cr.set_source_rgba(*WHITE_25)
+            cr.set_line_width(1.0)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Battery indicator — pill with fill
+# ═════════════════════════════════════════════════════════════
+
+
+class BatteryPill(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.level = None
+        self.set_content_width(32)
+        self.set_content_height(6)
+        self.set_draw_func(self._draw)
+
+    def set_level(self, level):
+        self.level = level
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        if self.level is None:
+            return
+        # Background pill
+        round_rect(cr, 0, 0, w, h, h / 2)
+        cr.set_source_rgba(*WHITE_12)
+        cr.fill()
+        # Fill
+        fill_w = max(h, w * (self.level / 100))
+        round_rect(cr, 0, 0, fill_w, h, h / 2)
+        if self.level <= 20:
+            cr.set_source_rgb(*RED)
+        elif self.level <= 50:
+            cr.set_source_rgba(*WARN_YELLOW)
+        else:
+            cr.set_source_rgba(*WHITE_85)
+        cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hero — dot-matrix bluetooth icon with scan pulse
+# ═════════════════════════════════════════════════════════════
+
+
+class HeroBluetooth(Gtk.DrawingArea):
+    """Bluetooth glyph as dot-matrix with wave animation from center."""
+
+    BT = [
+        ".....X.....",
+        ".....XX....",
+        ".....X.X...",
+        ".X...X..X..",
+        "..X..X.X...",
+        "...X.XX....",
+        "..X..X.X...",
+        ".X...X..X..",
+        ".....X.X...",
+        ".....XX....",
+        ".....X.....",
+    ]
+
+    def __init__(self, size=140):
+        super().__init__()
+        self.active = False
+        self.scanning = False
+        self.size = size
+        self._phase = 0.0
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+        GLib.timeout_add(50, self._tick)
+
+    def set_active(self, a):
+        if a != self.active:
+            self.active = a
+            self.queue_draw()
+
+    def set_scanning(self, s):
+        if s != self.scanning:
+            self.scanning = s
+            self.queue_draw()
+
+    def _tick(self):
+        if self.scanning:
+            self._phase = (self._phase + 0.04) % 1.0
+            self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        rows = len(self.BT)
+        cols = len(self.BT[0])
+        # Use most of canvas for the glyph (Nothing-style — big)
+        cell = min(w, h) / max(rows, cols)
+        dot_r = cell * 0.42
+        offset_x = (w - cols * cell) / 2 + cell / 2
+        offset_y = (h - rows * cell) / 2 + cell / 2
+        gcx, gcy = w / 2, h / 2
+        max_dist = math.hypot(cols * cell / 2, rows * cell / 2)
+
+        for r, row in enumerate(self.BT):
+            for c, ch in enumerate(row):
+                x = offset_x + c * cell
+                y = offset_y + r * cell
+
+                if ch == "X":
+                    if self.active:
+                        if self.scanning:
+                            # Wave radiating from center based on distance
+                            d = math.hypot(x - gcx, y - gcy) / max_dist
+                            # Distance-based phase offset
+                            wave = 1.0 - abs((d - self._phase) * 3) % 1.0
+                            wave = max(0.0, min(1.0, wave))
+                            # Base red (dimmed) + peak white-red at wave crest
+                            base_r = RED[0] * 0.6
+                            base_g = RED[1] * 0.3
+                            base_b = RED[2] * 0.3
+                            cr.set_source_rgba(base_r, base_g, base_b, 0.6 + 0.4 * wave)
+                            if wave > 0.7:
+                                cr.set_source_rgb(*RED)
+                        else:
+                            cr.set_source_rgb(*RED)
+                    else:
+                        cr.set_source_rgba(*WHITE_50)
+                    cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                    cr.fill()
+                else:
+                    cr.set_source_rgba(*WHITE_06)
+                    cr.arc(x, y, dot_r * 0.4, 0, 2 * math.pi)
+                    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  AdapterRow — icon + label + right widget
+# ═════════════════════════════════════════════════════════════
+
+
+class AdapterRow(Gtk.Box):
+    def __init__(self, label, icon_fn, right_widget):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.set_margin_start(28)
+        self.set_margin_end(20)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+
+        self.icon_area = Gtk.DrawingArea()
+        self.icon_area.set_content_width(20)
+        self.icon_area.set_content_height(20)
+        self.icon_area.set_valign(Gtk.Align.CENTER)
+        self._icon_fn = icon_fn
+        self._icon_active = False
+        self.icon_area.set_draw_func(self._draw_icon)
+        self.append(self.icon_area)
+
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.add_css_class("adapter-label-clean")
+        lbl.set_hexpand(True)
+        self.append(lbl)
+
+        right_widget.set_valign(Gtk.Align.CENTER)
+        self.append(right_widget)
+
+    def _draw_icon(self, area, cr, w, h):
+        col = (*RED, 1.0) if self._icon_active else WHITE_70
+        self._icon_fn(cr, w / 2, h / 2, False, 20, color=col)
+
+    def set_icon_active(self, active):
+        if active != self._icon_active:
+            self._icon_active = active
+            self.icon_area.queue_draw()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Bluetooth device row
+# ═════════════════════════════════════════════════════════════
+
+
+class BluetoothDeviceRow(Gtk.Button):
+    def __init__(self, device, on_select):
+        super().__init__()
+        self.device = device
+        self.on_select = on_select
+        self._busy = False
+        self.add_css_class("list-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        box.set_margin_top(2)
+        box.set_margin_bottom(2)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+
+        # Status dot
+        self.dot = StatusDot(size=8)
+        self.dot.set_valign(Gtk.Align.CENTER)
+        box.append(self.dot)
+
+        # Info column
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.name_lbl = Gtk.Label(xalign=0)
+        self.name_lbl.add_css_class("row-name")
+        self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        name_row.append(self.name_lbl)
+        info.append(name_row)
+
+        sub_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        sub_row.set_valign(Gtk.Align.CENTER)
+
+        self.mac_lbl = Gtk.Label(xalign=0)
+        self.mac_lbl.add_css_class("row-mac")
+        sub_row.append(self.mac_lbl)
+
+        self.status_lbl = Gtk.Label(xalign=0)
+        self.status_lbl.add_css_class("row-status")
+        sub_row.append(self.status_lbl)
+
+        self.bat_pill = BatteryPill()
+        self.bat_pill.set_valign(Gtk.Align.CENTER)
+        sub_row.append(self.bat_pill)
+
+        self.bat_lbl = Gtk.Label()
+        self.bat_lbl.add_css_class("row-mac")
+        sub_row.append(self.bat_lbl)
+
+        info.append(sub_row)
+        box.append(info)
+
+        # Right action label
+        self.right_lbl = Gtk.Label()
+        self.right_lbl.add_css_class("row-action")
+        self.right_lbl.set_valign(Gtk.Align.CENTER)
+        box.append(self.right_lbl)
+
+        self.set_child(box)
+        self.connect("clicked", self._on_click)
+        self.update(device)
+
+    def update(self, device):
+        self.device = device
+        self.name_lbl.set_text(clean_name(device["name"]))
+        self.mac_lbl.set_text(short_mac(device["mac"]))
+
+        if device["connected"]:
+            self.add_css_class("active")
+            self.dot.set_active(True)
+        else:
+            self.remove_css_class("active")
+            self.dot.set_active(False)
+
+        if self._busy:
+            self.status_lbl.set_text("· ···")
+        elif device["connected"]:
+            self.status_lbl.set_text("· CONNECTED")
+        elif device["paired"]:
+            self.status_lbl.set_text("· PAIRED")
+        else:
+            self.status_lbl.set_text("· AVAILABLE")
+
+        bat = device.get("battery")
+        if bat is not None and device["connected"]:
+            self.bat_pill.set_level(bat)
+            self.bat_lbl.set_text(f"{bat}%")
+            self.bat_pill.set_visible(True)
+            self.bat_lbl.set_visible(True)
+        else:
+            self.bat_pill.set_visible(False)
+            self.bat_lbl.set_visible(False)
+
+        if self._busy:
+            self.right_lbl.set_text("···")
+        elif device["connected"]:
+            self.right_lbl.set_text("DISCONNECT")
+        elif device["paired"]:
+            self.right_lbl.set_text("CONNECT")
+        else:
+            self.right_lbl.set_text("PAIR")
+
+        self.set_sensitive(not self._busy)
+
+    def set_busy(self, busy):
+        self._busy = busy
+        self.update(self.device)
+
+    def _on_click(self, _btn):
+        if self._busy:
+            return
+        self.on_select(self)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingBluetoothWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self.cfg = DEFAULTS
+        self._updating = False
+        self._row_cache = {}
+        self._refresh_pending = False
+        self._inflight_macs = set()
+
+        self.set_title("nothing-bluetooth")
+        self.set_default_size(int(self.cfg["width"]), int(self.cfg["height"]))
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-bluetooth")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(
+                self, LayerShell.Edge.TOP, int(self.cfg["margin_top"])
+            )
+            LayerShell.set_margin(
+                self, LayerShell.Edge.RIGHT, int(self.cfg["margin_right"])
+            )
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="BLUETOOTH", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+
+        self.header_status = Gtk.Label(label="OFF")
+        self.header_status.add_css_class("header-meta")
+        header.append(self.header_status)
+        card.append(header)
+
+        # ─── Hero ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(8)
+        hero.set_margin_bottom(10)
+
+        self.hero = HeroBluetooth(size=140)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+
+        self.hero_status = Gtk.Label(label="OFF")
+        self.hero_status.add_css_class("hero-date")
+        hero.append(self.hero_status)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(14)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── ADAPTER section ───
+        ad_hdr = self._mk_section_hdr("ADAPTER")
+        card.append(ad_hdr)
+
+        # Bluetooth toggle row (CircleButton)
+        self.bt_circle = CircleButton(_draw_bluetooth, size=40, toggle=True)
+        self.bt_circle.connect("toggled", self._on_power_toggled)
+        self.bt_adapter = AdapterRow("Bluetooth", _draw_bluetooth, self.bt_circle)
+        card.append(self.bt_adapter)
+
+        # Scan row (ScanButton)
+        self.scan_btn = ScanButton(size=40)
+        self.scan_btn.connect("clicked", lambda _b: self._on_scan_clicked())
+        self.scan_adapter = AdapterRow("Scan for devices", _draw_scan, self.scan_btn)
+        card.append(self.scan_adapter)
+
+        # ─── DEVICES section ───
+        dev_hdr_row, self.dev_counter = self._mk_section_hdr_count("DEVICES")
+        card.append(dev_hdr_row)
+
+        self.devices_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.devices_box.set_margin_start(20)
+        self.devices_box.set_margin_end(20)
+        self.devices_box.set_margin_top(4)
+        card.append(self.devices_box)
+
+        self.empty_label = Gtk.Label(label="NO DEVICES")
+        self.empty_label.add_css_class("empty-label-clean")
+        self.empty_label.set_margin_top(28)
+        self.empty_label.set_margin_bottom(28)
+        card.append(self.empty_label)
+
+        bottom_spacer = Gtk.Box()
+        bottom_spacer.set_size_request(-1, 28)
+        card.append(bottom_spacer)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        self._kick_refresh()
+        self._refresh_timer = GLib.timeout_add(3000, self._auto_refresh)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_section_hdr(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(8)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _mk_section_hdr_count(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(8)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        counter = Gtk.Label(label="")
+        counter.add_css_class("section-counter-mono")
+        row.append(counter)
+        return (row, counter)
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    # ── Async refresh ─────────────────────────────────
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def worker():
+            try:
+                powered = BluetoothBackend.powered()
+                scanning = BluetoothBackend.scanning() if powered else False
+                devices = BluetoothBackend.list_all_with_info() if powered else []
+            except Exception as e:
+                print(f"[bt] refresh: {e}", file=sys.stderr)
+                powered, scanning, devices = False, False, []
+            GLib.idle_add(self._apply_refresh, powered, scanning, devices)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_refresh(self, powered, scanning, devices):
+        self._refresh_pending = False
+        self._updating = True
+
+        # Toggle button
+        self.bt_circle.set_active(powered, emit=False)
+
+        # Hero
+        self.hero.set_active(powered)
+        self.hero.set_scanning(scanning)
+
+        # Adapter icons
+        self.bt_adapter.set_icon_active(powered)
+        self.scan_adapter.set_icon_active(scanning)
+
+        # Scan button state
+        self.scan_btn.set_enabled(powered)
+        self.scan_btn.set_scanning(scanning)
+
+        # Status labels
+        if powered:
+            if scanning:
+                self.hero_status.set_text("SCANNING")
+                self.header_status.set_text("SCAN")
+            else:
+                self.hero_status.set_text("READY")
+                connected_dev = next((d for d in devices if d["connected"]), None)
+                if connected_dev:
+                    self.header_status.set_text(f"·{short_mac(connected_dev['mac'])}")
+                else:
+                    self.header_status.set_text("ON")
+        else:
+            self.hero_status.set_text("OFFLINE")
+            self.header_status.set_text("OFF")
+
+        # Devices counter
+        if powered and devices:
+            connected = sum(1 for d in devices if d["connected"])
+            total = len(devices)
+            self.dev_counter.set_text(
+                f"{connected}/{total}" if connected else f"{total}"
+            )
+        else:
+            self.dev_counter.set_text("")
+
+        # Devices list
+        if not powered:
+            self._clear_rows()
+            self.empty_label.set_text("TURN ON BLUETOOTH")
+            self.empty_label.set_visible(True)
+        elif not devices:
+            self._clear_rows()
+            self.empty_label.set_text(
+                "SCAN FOR DEVICES" if not scanning else "SEARCHING…"
+            )
+            self.empty_label.set_visible(True)
+        else:
+            self.empty_label.set_visible(False)
+            self._diff_rows(devices)
+
+        self._updating = False
+        return False
+
+    def _clear_rows(self):
+        while child := self.devices_box.get_first_child():
+            self.devices_box.remove(child)
+        self._row_cache.clear()
+
+    def _diff_rows(self, devices):
+        while child := self.devices_box.get_first_child():
+            self.devices_box.remove(child)
+
+        new_set = {d["mac"] for d in devices}
+        for mac in list(self._row_cache.keys()):
+            if mac not in new_set:
+                del self._row_cache[mac]
+
+        for i, dev in enumerate(devices):
+            mac = dev["mac"]
+            if mac in self._row_cache:
+                row = self._row_cache[mac]
+                if mac in self._inflight_macs:
+                    row._busy = True
+                row.update(dev)
+            else:
+                row = BluetoothDeviceRow(dev, self._on_device_clicked)
+                self._row_cache[mac] = row
+            self.devices_box.append(row)
+            if i < len(devices) - 1:
+                div = Gtk.Box()
+                div.add_css_class("row-divider-inline")
+                div.set_margin_start(20)
+                div.set_margin_end(8)
+                div.set_size_request(-1, 1)
+                self.devices_box.append(div)
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    # ── Actions ────────────────────────────────────────
+
+    def _on_power_toggled(self, _btn, active):
+        if self._updating:
+            return
+
+        def worker():
+            try:
+                BluetoothBackend.set_power(active)
+            except Exception as e:
+                print(f"[bt] power: {e}", file=sys.stderr)
+            GLib.idle_add(self._kick_refresh)
+            if active:
+                notify_info(
+                    "Bluetooth on",
+                    app="nothing-bluetooth",
+                    icon="bluetooth",
+                    timeout=1500,
+                )
+            else:
+                notify_info(
+                    "Bluetooth off",
+                    app="nothing-bluetooth",
+                    icon="bluetooth-disabled",
+                    timeout=1500,
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_scan_clicked(self):
+        def worker():
+            try:
+                if not BluetoothBackend.powered():
+                    return
+                if BluetoothBackend.scanning():
+                    BluetoothBackend.stop_scan()
+                else:
+                    BluetoothBackend.start_scan()
+                    notify_info(
+                        "Scanning for devices",
+                        "Looking for nearby Bluetooth devices…",
+                        app="nothing-bluetooth",
+                        timeout=2500,
+                    )
+            except Exception as e:
+                print(f"[bt] scan: {e}", file=sys.stderr)
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_device_clicked(self, row):
+        device = row.device
+        mac = device["mac"]
+        if mac in self._inflight_macs:
+            return
+        self._inflight_macs.add(mac)
+        row.set_busy(True)
+
+        if device["connected"]:
+            action = "disconnect"
+        elif device["paired"]:
+            action = "connect"
+        else:
+            action = "pair"
+
+        def worker():
+            success = True
+            try:
+                if action == "connect":
+                    BluetoothBackend.connect(mac)
+                elif action == "disconnect":
+                    BluetoothBackend.disconnect(mac)
+                elif action == "pair":
+                    BluetoothBackend.trust(mac)
+                    BluetoothBackend.pair(mac)
+                    BluetoothBackend.connect(mac)
+            except Exception as e:
+                print(f"[bt] action: {e}", file=sys.stderr)
+                success = False
+
+            try:
+                fresh = BluetoothBackend.list_all_with_info()
+                fresh_dev = next((d for d in fresh if d["mac"] == mac), None)
+            except Exception:
+                fresh_dev = None
+
+            if fresh_dev:
+                if action in ("connect", "pair"):
+                    success = fresh_dev["connected"]
+                elif action == "disconnect":
+                    success = not fresh_dev["connected"]
+                notify_dev = fresh_dev
+            else:
+                notify_dev = device
+                success = False
+
+            send_bt_action_notification(notify_dev, action, success)
+
+            def done():
+                self._inflight_macs.discard(mac)
+                if mac in self._row_cache:
+                    self._row_cache[mac]._busy = False
+                self._kick_refresh()
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_key(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    # ── Show / Hide ───────────────────────────────────
+
+    def show_popup(self):
+        close_other_popups("nothing-bluetooth")
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingBluetoothApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .section-counter-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 1px;
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+    .adapter-label-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+
+    /* Device row — flat */
+    .list-row {
+        background: transparent;
+        background-color: transparent;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 12px;
+        min-height: 0;
+        box-shadow: none;
+        transition: background-color 120ms ease;
+    }
+    .list-row:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+    .list-row.active {
+        background-color: rgba(255, 45, 45, 0.06);
+    }
+    .list-row.active:hover {
+        background-color: rgba(255, 45, 45, 0.10);
+    }
+
+    /* Row text */
+    .row-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .row-mac {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1px;
+    }
+    .row-status {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.50);
+        letter-spacing: 1.5px;
+    }
+    .list-row.active .row-status {
+        color: #FF2D2D;
+    }
+    .row-action {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1.5px;
+    }
+    .list-row:hover .row-action {
+        color: #FFFFFF;
+    }
+    .list-row.active .row-action {
+        color: #FF2D2D;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.bluetooth",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("daemon", "d", "Run as daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingBluetoothWindow(self)
+        self.hold()
+
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict().end().unpack()
+        if "quit" in options:
+            self.quit()
+            return 0
+        if "hide" in options:
+            self.window.hide_popup()
+        elif "toggle" in options:
+            self.window.toggle_popup()
+        elif "show" in options:
+            self.window.show_popup()
+        elif "daemon" in options:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingBluetoothApp()
+    sys.exit(app.run(sys.argv))

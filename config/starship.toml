@@ -1,0 +1,140 @@
+# ═══════════════════════════════════════════════════════════
+#  Nothing OS — Starship prompt
+# ═══════════════════════════════════════════════════════════
+
+format = """
+[●](red bold) [$username](#C8C8CC)[@](dim)[$hostname](#C8C8CC) [│](dim) [$directory](#F7F7F7) $git_branch$git_status$cmd_duration$line_break$character"""
+
+right_format = """[$time](dim)"""
+
+add_newline = false
+scan_timeout = 30
+command_timeout = 500
+
+# ─── Character (prompt symbol) ──────────────────────────────
+
+[character]
+success_symbol = "[›](red bold)"
+error_symbol = "[›](red bold)"
+vimcmd_symbol = "[‹](red bold)"
+
+# ─── Time ────────────────────────────────────────────────────
+
+[time]
+disabled = false
+format = "[$time]($style)"
+time_format = "%H:%M"
+style = "#6E6E73"
+
+# ─── Username ────────────────────────────────────────────────
+
+[username]
+show_always = true
+format = "[$user]($style)"
+style_user = "#C8C8CC bold"
+style_root = "red bold"
+
+# ─── Hostname ────────────────────────────────────────────────
+
+[hostname]
+ssh_only = false
+format = "[$hostname]($style)"
+style = "#C8C8CC bold"
+disabled = false
+
+# ─── Directory ───────────────────────────────────────────────
+
+[directory]
+format = "[$path]($style)[$read_only]($read_only_style)"
+style = "#F7F7F7 bold"
+read_only = " 🔒"
+read_only_style = "red"
+truncation_length = 3
+truncation_symbol = "…/"
+home_symbol = "~"
+
+[directory.substitutions]
+"Documents" = "DOCS"
+"Downloads" = "DL"
+"Pictures"  = "PIX"
+"Videos"    = "VID"
+"Music"     = "MUS"
+
+# ─── Git ─────────────────────────────────────────────────────
+
+[git_branch]
+format = "[│](dim) [$symbol$branch]($style)"
+symbol = " "
+style = "#FF2D2D"
+truncation_length = 24
+truncation_symbol = "…"
+
+[git_status]
+format = '([\[$all_status$ahead_behind\]]($style))'
+style = "#FF6B6B"
+conflicted = "✕"
+ahead = "↑${count}"
+behind = "↓${count}"
+diverged = "↕${ahead_count}/${behind_count}"
+untracked = "?"
+stashed = "≡"
+modified = "M"
+staged = "+"
+renamed = "R"
+deleted = "D"
+
+# ─── Command duration ────────────────────────────────────────
+
+[cmd_duration]
+min_time = 2_000
+format = " [│](dim) [$duration]($style)"
+style = "#FFD60A"
+
+# ─── Languages / runtimes (compact, mono caps) ──────────────
+
+[python]
+symbol = "PY "
+format = "[│](dim) [$symbol$version]($style) "
+style = "#FF6B6B"
+detect_extensions = ["py"]
+detect_files = ["pyproject.toml", "requirements.txt", "Pipfile"]
+
+[nodejs]
+symbol = "JS "
+format = "[│](dim) [$symbol$version]($style) "
+style = "#FF6B6B"
+
+[rust]
+symbol = "RS "
+format = "[│](dim) [$symbol$version]($style) "
+style = "#FF6B6B"
+
+[golang]
+symbol = "GO "
+format = "[│](dim) [$symbol$version]($style) "
+style = "#FF6B6B"
+
+[docker_context]
+symbol = "DK "
+format = "[│](dim) [$symbol$context]($style) "
+style = "#FF6B6B"
+
+# ─── Disable noise ───────────────────────────────────────────
+
+[package]
+disabled = true
+
+[lua]
+disabled = true
+
+[gradle]
+disabled = true
+
+[battery]
+disabled = true
+
+[memory_usage]
+disabled = true
+
+[shlvl]
+disabled = true

@@ -1,0 +1,1420 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Screen Recorder
+Unified with control/volume/network/bluetooth design language:
+  - red glyph dot in header
+  - hero dot-matrix REC indicator with pulse
+  - CircleButton toggles for options
+  - flat last-file row
+  - bug fix: fullscreen recording (auto-detect output)
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import json
+import math
+import shutil
+import signal
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_notify import (
+        listen_for_action,
+        notify,
+        notify_error,
+        notify_info,
+        notify_success,
+    )
+except ImportError:
+
+    def notify(*a, **kw):
+        return None
+
+    def notify_success(*a, **kw):
+        return None
+
+    def notify_error(*a, **kw):
+        return None
+
+    def notify_info(*a, **kw):
+        return None
+
+    def listen_for_action(*a, **kw):
+        pass
+
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+
+STATE_FILE = Path("/tmp/nothing-recorder.state")
+PID_FILE = Path("/tmp/nothing-recorder.pid")
+LOG_FILE = Path("/tmp/nothing-recorder.log")
+OUTPUT_DIR = Path.home() / "Videos" / "NothingRec"
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+
+
+def log(msg):
+    print(f"[rec] {msg}", file=sys.stderr, flush=True)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Compositor detection helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def _hyprland_focused_monitor():
+    """Get the focused monitor name via Hyprland IPC."""
+    try:
+        r = subprocess.run(
+            ["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0 and r.stdout:
+            mons = json.loads(r.stdout)
+            for m in mons:
+                if m.get("focused"):
+                    return m.get("name")
+            if mons:
+                return mons[0].get("name")
+    except Exception as e:
+        log(f"hyprctl monitors: {e}")
+    return None
+
+
+def _wlr_first_output():
+    """Fallback: try to get first output from wlr-randr."""
+    if not shutil.which("wlr-randr"):
+        return None
+    try:
+        r = subprocess.run(["wlr-randr"], capture_output=True, text=True, timeout=2)
+        if r.returncode == 0 and r.stdout:
+            for line in r.stdout.split("\n"):
+                if line and not line.startswith(" "):
+                    # First non-indented line is monitor name
+                    name = line.split()[0]
+                    if name:
+                        return name
+    except Exception:
+        pass
+    return None
+
+
+def _detect_output():
+    """Detect screen output to record from."""
+    # Try Hyprland first
+    out = _hyprland_focused_monitor()
+    if out:
+        return out
+    # Try wlr-randr
+    out = _wlr_first_output()
+    if out:
+        return out
+    return None
+
+
+def _detect_audio_source():
+    """Return default pipewire/pulse source for --audio=NAME."""
+    try:
+        r = subprocess.run(
+            ["pactl", "get-default-sink"], capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            # wf-recorder captures monitor of sink: <sink>.monitor
+            return r.stdout.strip() + ".monitor"
+    except Exception:
+        pass
+    return None
+
+
+# ═════════════════════════════════════════════════════════════
+#  Recorder backend (with bug fix)
+# ═════════════════════════════════════════════════════════════
+
+
+class Recorder:
+    @staticmethod
+    def is_recording():
+        if not PID_FILE.exists():
+            return False
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            try:
+                PID_FILE.unlink(missing_ok=True)
+                STATE_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+    @staticmethod
+    def started_at():
+        if STATE_FILE.exists():
+            try:
+                for line in STATE_FILE.read_text().strip().split("\n"):
+                    if line.startswith("start="):
+                        return float(line.split("=", 1)[1])
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def output_path():
+        if STATE_FILE.exists():
+            try:
+                for line in STATE_FILE.read_text().strip().split("\n"):
+                    if line.startswith("file="):
+                        return line.split("=", 1)[1]
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def start(region=False, audio=False):
+        """Returns (success, error_message)."""
+        if Recorder.is_recording():
+            return (False, "Already recording")
+
+        if not shutil.which("wf-recorder"):
+            return (False, "wf-recorder not installed")
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        out = OUTPUT_DIR / f"rec_{ts}.mp4"
+
+        cmd = ["wf-recorder"]
+
+        # ─── Geometry / output selection ───
+        if region:
+            if not shutil.which("slurp"):
+                return (False, "slurp not installed (needed for region)")
+            try:
+                r = subprocess.run(
+                    ["slurp"], capture_output=True, text=True, timeout=60
+                )
+                geom = r.stdout.strip()
+                if not geom:
+                    return (False, "Region selection cancelled")
+                cmd += ["-g", geom]
+            except subprocess.TimeoutExpired:
+                return (False, "Region selection timed out")
+            except Exception as e:
+                return (False, f"slurp error: {e}")
+        else:
+            # ★ BUG FIX: explicitly select output for full-screen
+            # Without this wf-recorder may fail silently on multi-monitor
+            output = _detect_output()
+            if output:
+                cmd += ["-o", output]
+                log(f"recording output: {output}")
+            else:
+                log("warning: no output detected, wf-recorder will use default")
+
+        # ─── Audio ───
+        if audio:
+            src = _detect_audio_source()
+            if src:
+                cmd += [f"--audio={src}"]
+                log(f"audio source: {src}")
+            else:
+                cmd += ["--audio"]  # let wf-recorder pick default
+
+        # ─── Codec (h264 hardware accel where possible) ───
+        # Soft fallback to libx264 if vaapi not available
+        cmd += [
+            "-c",
+            "libx264",
+            "-p",
+            "preset=ultrafast",
+            "-p",
+            "crf=23",
+            "-p",
+            "pix_fmt=yuv420p",
+        ]
+
+        # ─── Output file ───
+        cmd += ["-f", str(out)]
+
+        log(f"command: {' '.join(cmd)}")
+
+        # Run and capture initial stderr to detect immediate failure
+        try:
+            log_fh = open(LOG_FILE, "w")
+            proc = subprocess.Popen(
+                cmd, stdout=log_fh, stderr=subprocess.STDOUT, start_new_session=True
+            )
+        except Exception as e:
+            return (False, f"Failed to spawn: {e}")
+
+        # Check it actually started (give it 0.6s to crash)
+        time.sleep(0.6)
+        if proc.poll() is not None:
+            # Process died immediately, read log
+            try:
+                log_text = LOG_FILE.read_text().strip()
+            except Exception:
+                log_text = ""
+            log(f"wf-recorder died: {log_text}")
+            return (
+                False,
+                log_text[:200] if log_text else "wf-recorder exited immediately",
+            )
+
+        # Success — write state
+        PID_FILE.write_text(str(proc.pid))
+        STATE_FILE.write_text(
+            f"start={time.time()}\n"
+            f"file={out}\n"
+            f"audio={int(audio)}\n"
+            f"region={int(region)}\n"
+        )
+        return (True, "")
+
+    @staticmethod
+    def stop():
+        if not Recorder.is_recording():
+            return False
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            # Send SIGINT to process group (start_new_session creates group)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                # Fallback: just signal main pid
+                try:
+                    os.kill(pid, signal.SIGINT)
+                except Exception:
+                    pass
+
+            # Wait up to 3 seconds for graceful shutdown (file flush)
+            for _ in range(60):
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.05)
+                except Exception:
+                    break
+            else:
+                # Force kill if still alive
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"stop: {e}")
+        try:
+            PID_FILE.unlink(missing_ok=True)
+            STATE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True
+
+
+def send_recording_started_notification(region, audio):
+    body = []
+    body.append("Region" if region else "Full screen")
+    if audio:
+        body.append("Audio on")
+    notify(
+        "Recording started",
+        " · ".join(body),
+        app="nothing-recorder",
+        icon="media-record",
+        urgency="normal",
+        timeout=2500,
+    )
+
+
+def send_recording_stopped_notification(path):
+    if not path or not os.path.exists(path):
+        notify_info("Recording stopped", app="nothing-recorder", timeout=2000)
+        return
+    nid = notify(
+        "Recording saved",
+        os.path.basename(path),
+        app="nothing-recorder",
+        icon="media-record",
+        urgency="normal",
+        timeout=5000,
+        actions=[("open", "Open"), ("folder", "Folder"), ("delete", "Delete")],
+    )
+
+    def on_action(action_id):
+        if action_id == "open":
+            subprocess.Popen(
+                ["xdg-open", path],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif action_id == "folder":
+            subprocess.Popen(
+                ["xdg-open", os.path.dirname(path)],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif action_id == "delete":
+            try:
+                os.remove(path)
+                notify_success("Recording deleted", app="nothing-recorder")
+            except Exception as e:
+                notify_error("Delete failed", str(e), app="nothing-recorder")
+
+    listen_for_action(nid, on_action, timeout=15)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_region(cr, cx, cy, active=False, size=22, color=None):
+    """Crop / region selection icon — 4 corner brackets."""
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.36
+    L = size * 0.16
+    # Top-left
+    cr.move_to(cx - s, cy - s + L)
+    cr.line_to(cx - s, cy - s)
+    cr.line_to(cx - s + L, cy - s)
+    cr.stroke()
+    # Top-right
+    cr.move_to(cx + s - L, cy - s)
+    cr.line_to(cx + s, cy - s)
+    cr.line_to(cx + s, cy - s + L)
+    cr.stroke()
+    # Bottom-left
+    cr.move_to(cx - s, cy + s - L)
+    cr.line_to(cx - s, cy + s)
+    cr.line_to(cx - s + L, cy + s)
+    cr.stroke()
+    # Bottom-right
+    cr.move_to(cx + s - L, cy + s)
+    cr.line_to(cx + s, cy + s)
+    cr.line_to(cx + s, cy + s - L)
+    cr.stroke()
+
+
+def _draw_mic(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.30
+    round_rect(cr, cx - s * 0.55, cy - s * 1.05, s * 1.10, s * 1.30, s * 0.55)
+    cr.fill()
+    cr.arc(cx, cy + s * 0.10, s * 0.85, 0.25, math.pi - 0.25)
+    cr.stroke()
+    cr.move_to(cx, cy + s * 0.95)
+    cr.line_to(cx, cy + s * 1.30)
+    cr.stroke()
+    cr.move_to(cx - s * 0.50, cy + s * 1.30)
+    cr.line_to(cx + s * 0.50, cy + s * 1.30)
+    cr.stroke()
+
+
+def _draw_file(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    # Document outline with folded corner
+    cr.move_to(cx - s * 0.85, cy - s)
+    cr.line_to(cx + s * 0.40, cy - s)
+    cr.line_to(cx + s * 0.85, cy - s * 0.55)
+    cr.line_to(cx + s * 0.85, cy + s)
+    cr.line_to(cx - s * 0.85, cy + s)
+    cr.close_path()
+    cr.stroke()
+    # Folded corner
+    cr.move_to(cx + s * 0.40, cy - s)
+    cr.line_to(cx + s * 0.40, cy - s * 0.55)
+    cr.line_to(cx + s * 0.85, cy - s * 0.55)
+    cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton (shared)
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a, emit=False):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+            if emit:
+                self.emit("toggled", self._active)
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  AdapterRow (shared pattern)
+# ═════════════════════════════════════════════════════════════
+
+
+class AdapterRow(Gtk.Box):
+    def __init__(self, label, icon_fn, right_widget):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.set_margin_start(28)
+        self.set_margin_end(20)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+
+        self.icon_area = Gtk.DrawingArea()
+        self.icon_area.set_content_width(20)
+        self.icon_area.set_content_height(20)
+        self.icon_area.set_valign(Gtk.Align.CENTER)
+        self._icon_fn = icon_fn
+        self._icon_active = False
+        self.icon_area.set_draw_func(self._draw_icon)
+        self.append(self.icon_area)
+
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.add_css_class("adapter-label-clean")
+        lbl.set_hexpand(True)
+        self.append(lbl)
+
+        right_widget.set_valign(Gtk.Align.CENTER)
+        self.append(right_widget)
+
+    def _draw_icon(self, area, cr, w, h):
+        col = (*RED, 1.0) if self._icon_active else WHITE_70
+        self._icon_fn(cr, w / 2, h / 2, False, 20, color=col)
+
+    def set_icon_active(self, active):
+        if active != self._icon_active:
+            self._icon_active = active
+            self.icon_area.queue_draw()
+
+
+# ═════════════════════════════════════════════════════════════
+#  StatusDot
+# ═════════════════════════════════════════════════════════════
+
+
+class StatusDot(Gtk.DrawingArea):
+    def __init__(self, size=10):
+        super().__init__()
+        self.active = False
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_active(self, a):
+        self.active = a
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cx, cy = w / 2, h / 2
+        r = min(w, h) / 2 - 1
+        if self.active:
+            cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            cr.set_source_rgba(*WHITE_25)
+            cr.set_line_width(1.0)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hero REC — dot-matrix
+# ═════════════════════════════════════════════════════════════
+
+
+class HeroREC(Gtk.DrawingArea):
+    """Big REC dot-matrix indicator. Pulses red when recording."""
+
+    LETTERS = {
+        "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+        "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+        "C": ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
+        " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+    }
+
+    DOT = [
+        "00000",
+        "00000",
+        "01110",
+        "11111",
+        "11111",
+        "01110",
+        "00000",
+    ]
+
+    def __init__(self, size=140):
+        super().__init__()
+        self.recording = False
+        self._phase = 0.0
+        self.size = size
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+        GLib.timeout_add(60, self._tick)
+
+    def set_recording(self, on):
+        if on != self.recording:
+            self.recording = on
+            self.queue_draw()
+
+    def _tick(self):
+        if self.recording:
+            self._phase = (self._phase + 0.04) % 1.0
+            self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        rows = 7
+        cell = min(h / (rows + 2.5), 10)
+        char_w = 5 * cell
+        gap = cell * 0.7
+        dot_r = cell * 0.42
+        dot_r_off = cell * 0.16
+
+        if self.recording:
+            # 'REC' + leading dot
+            chars = ["●", "R", "E", "C"]
+        else:
+            chars = ["R", "E", "C"]
+
+        total_w = len(chars) * char_w + (len(chars) - 1) * gap
+        start_x = (w - total_w) / 2
+        start_y = (h - rows * cell) / 2
+
+        for ci, ch in enumerate(chars):
+            if ch == "●":
+                glyph = self.DOT
+            else:
+                glyph = self.LETTERS.get(ch, self.LETTERS[" "])
+            gx = start_x + ci * (char_w + gap)
+            for r in range(rows):
+                for c in range(5):
+                    x = gx + c * cell + cell / 2
+                    y = start_y + r * cell + cell / 2
+                    on = glyph[r][c] == "1"
+                    if on:
+                        if self.recording:
+                            if ch == "●":
+                                # Pulse the red dot
+                                br = 0.55 + 0.45 * abs(
+                                    math.sin(self._phase * 2 * math.pi)
+                                )
+                                cr.set_source_rgba(RED[0], RED[1], RED[2], br)
+                            else:
+                                cr.set_source_rgb(*RED)
+                        else:
+                            cr.set_source_rgba(*WHITE_50)
+                        cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                    else:
+                        cr.set_source_rgba(*WHITE_06)
+                        cr.arc(x, y, dot_r_off, 0, 2 * math.pi)
+                    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingRecorderWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+
+        self.set_title("nothing-recorder")
+        self.set_default_size(380, 540)
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-recorder")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 12)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, 12)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="RECORDER", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+
+        self.header_status = Gtk.Label(label="IDLE")
+        self.header_status.add_css_class("header-meta")
+        header.append(self.header_status)
+        card.append(header)
+
+        # ─── Hero ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(14)
+        hero.set_margin_bottom(8)
+        self.hero = HeroREC(size=140)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+
+        self.hero_status = Gtk.Label(label="READY")
+        self.hero_status.add_css_class("hero-date")
+        hero.append(self.hero_status)
+
+        self.elapsed_lbl = Gtk.Label(label="")
+        self.elapsed_lbl.add_css_class("hero-time-mono")
+        hero.append(self.elapsed_lbl)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(18)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── OPTIONS ───
+        opt_hdr = self._mk_section_hdr("OPTIONS")
+        card.append(opt_hdr)
+
+        # Region toggle
+        self.region_circle = CircleButton(_draw_region, size=40, toggle=True)
+        self.region_adapter = AdapterRow("Region", _draw_region, self.region_circle)
+        card.append(self.region_adapter)
+
+        # Audio toggle
+        self.audio_circle = CircleButton(_draw_mic, size=40, toggle=True)
+        self.audio_adapter = AdapterRow(
+            "Microphone audio", _draw_mic, self.audio_circle
+        )
+        card.append(self.audio_adapter)
+
+        # ─── ACTION button ───
+        act_wrap = Gtk.Box()
+        act_wrap.set_margin_start(20)
+        act_wrap.set_margin_end(20)
+        act_wrap.set_margin_top(22)
+        self.action_btn = Gtk.Button(label="START")
+        self.action_btn.add_css_class("rec-btn-start")
+        self.action_btn.set_hexpand(True)
+        self.action_btn.connect("clicked", self._on_action)
+        act_wrap.append(self.action_btn)
+        card.append(act_wrap)
+
+        # ─── LAST FILE ───
+        last_hdr = self._mk_section_hdr("LAST FILE")
+        card.append(last_hdr)
+
+        self.last_file_row = Gtk.Button()
+        self.last_file_row.add_css_class("last-file-row")
+        self.last_file_row.set_margin_start(20)
+        self.last_file_row.set_margin_end(20)
+        self.last_file_row.connect("clicked", self._on_last_file_clicked)
+
+        lf_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        lf_box.set_margin_top(10)
+        lf_box.set_margin_bottom(10)
+        lf_box.set_margin_start(14)
+        lf_box.set_margin_end(14)
+
+        file_icon = Gtk.DrawingArea()
+        file_icon.set_content_width(18)
+        file_icon.set_content_height(18)
+        file_icon.set_valign(Gtk.Align.CENTER)
+        file_icon.set_draw_func(
+            lambda a, cr, w, h: _draw_file(cr, w / 2, h / 2, size=18, color=WHITE_50)
+        )
+        lf_box.append(file_icon)
+
+        lf_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        lf_info.set_hexpand(True)
+        lf_info.set_valign(Gtk.Align.CENTER)
+
+        self.last_file_name = Gtk.Label(label="No recordings", xalign=0)
+        self.last_file_name.add_css_class("last-file-name")
+        self.last_file_name.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        lf_info.append(self.last_file_name)
+
+        self.last_file_meta = Gtk.Label(label="", xalign=0)
+        self.last_file_meta.add_css_class("last-file-meta")
+        lf_info.append(self.last_file_meta)
+
+        lf_box.append(lf_info)
+
+        self.last_file_action = Gtk.Label(label="")
+        self.last_file_action.add_css_class("row-action")
+        self.last_file_action.set_valign(Gtk.Align.CENTER)
+        lf_box.append(self.last_file_action)
+
+        self.last_file_row.set_child(lf_box)
+        card.append(self.last_file_row)
+
+        bottom = Gtk.Box()
+        bottom.set_size_request(-1, 28)
+        card.append(bottom)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        GLib.timeout_add(500, self._tick_state)
+        self._tick_state()
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_section_hdr(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(8)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _tick_state(self):
+        rec = Recorder.is_recording()
+        self.hero.set_recording(rec)
+
+        if rec:
+            self.hero_status.set_text("RECORDING")
+            self.header_status.set_text("REC")
+            self.action_btn.set_label("STOP")
+            self.action_btn.remove_css_class("rec-btn-start")
+            self.action_btn.add_css_class("rec-btn-stop")
+
+            started = Recorder.started_at()
+            if started:
+                elapsed = int(time.time() - started)
+                mm, ss = divmod(elapsed, 60)
+                hh, mm = divmod(mm, 60)
+                if hh:
+                    self.elapsed_lbl.set_text(f"{hh:02d}:{mm:02d}:{ss:02d}")
+                else:
+                    self.elapsed_lbl.set_text(f"{mm:02d}:{ss:02d}")
+            else:
+                self.elapsed_lbl.set_text("")
+
+            self.region_circle.set_sensitive(False)
+            self.audio_circle.set_sensitive(False)
+            self.region_adapter.set_icon_active(self.region_circle.get_active())
+            self.audio_adapter.set_icon_active(self.audio_circle.get_active())
+        else:
+            self.hero_status.set_text("READY")
+            self.header_status.set_text("IDLE")
+            self.action_btn.set_label("START")
+            self.action_btn.remove_css_class("rec-btn-stop")
+            self.action_btn.add_css_class("rec-btn-start")
+            self.elapsed_lbl.set_text("")
+            self.region_circle.set_sensitive(True)
+            self.audio_circle.set_sensitive(True)
+            self.region_adapter.set_icon_active(self.region_circle.get_active())
+            self.audio_adapter.set_icon_active(self.audio_circle.get_active())
+
+        # Last file
+        last = self._find_last_file()
+        if last:
+            path = Path(last)
+            self.last_file_name.set_text(path.name)
+            try:
+                size_b = path.stat().st_size
+                if size_b > 1024 * 1024:
+                    size_str = f"{size_b / 1024 / 1024:.1f} MB"
+                else:
+                    size_str = f"{size_b / 1024:.0f} KB"
+                self.last_file_meta.set_text(size_str)
+            except Exception:
+                self.last_file_meta.set_text("")
+            self.last_file_action.set_text("OPEN")
+            self.last_file_row.set_sensitive(True)
+        else:
+            self.last_file_name.set_text("No recordings yet")
+            self.last_file_meta.set_text("")
+            self.last_file_action.set_text("")
+            self.last_file_row.set_sensitive(False)
+
+        return True
+
+    def _find_last_file(self):
+        if Recorder.is_recording():
+            out = Recorder.output_path()
+            if out and os.path.exists(out):
+                return out
+        if not OUTPUT_DIR.exists():
+            return None
+        try:
+            files = sorted(
+                OUTPUT_DIR.glob("rec_*.mp4"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if files:
+                return str(files[0])
+        except Exception:
+            pass
+        return None
+
+    def _on_last_file_clicked(self, _btn):
+        last = self._find_last_file()
+        if last:
+            subprocess.Popen(
+                ["xdg-open", last],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    def _on_action(self, _btn):
+        if Recorder.is_recording():
+            out_path = Recorder.output_path()
+            Recorder.stop()
+            threading.Thread(
+                target=send_recording_stopped_notification,
+                args=(out_path,),
+                daemon=True,
+            ).start()
+        else:
+            region = self.region_circle.get_active()
+            audio = self.audio_circle.get_active()
+            if region:
+                # Hide popup briefly so slurp can paint the screen
+                self.set_visible(False)
+                GLib.timeout_add(
+                    200, lambda: (self._start_with_notify(region, audio), False)[1]
+                )
+            else:
+                self._start_with_notify(region, audio)
+        GLib.timeout_add(300, lambda: (self._tick_state(), False)[1])
+
+    def _start_with_notify(self, region, audio):
+        ok, err = Recorder.start(region=region, audio=audio)
+        if ok:
+            send_recording_started_notification(region, audio)
+        else:
+            notify_error(
+                "Recording failed",
+                err or "Could not start wf-recorder",
+                app="nothing-recorder",
+            )
+        return False
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-recorder")
+        self._tick_state()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingRecorderApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .hero-time-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 18px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+        margin-top: 4px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .adapter-label-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .row-action {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1.5px;
+    }
+
+    /* Big action button — START (white outline) */
+    .rec-btn-start {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 4px;
+        padding: 16px 0;
+        border-radius: 28px;
+        background-color: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: #FFFFFF;
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .rec-btn-start:hover {
+        background-color: rgba(255, 45, 45, 0.10);
+        border-color: rgba(255, 45, 45, 0.55);
+        color: #FF2D2D;
+    }
+
+    /* Big action button — STOP (red filled) */
+    .rec-btn-stop {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 4px;
+        padding: 16px 0;
+        border-radius: 28px;
+        background-color: #FF2D2D;
+        border: 1px solid #FF2D2D;
+        color: #FFFFFF;
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .rec-btn-stop:hover {
+        background-color: #FF4747;
+        border-color: #FF4747;
+    }
+
+    /* Last file row — flat clickable */
+    .last-file-row {
+        background: transparent;
+        background-color: transparent;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 12px;
+        padding: 0;
+        min-height: 0;
+        box-shadow: none;
+        transition: background-color 120ms ease,
+                    border-color 120ms ease;
+    }
+    .last-file-row:hover {
+        background-color: rgba(255, 255, 255, 0.04);
+        border-color: rgba(255, 255, 255, 0.12);
+    }
+    .last-file-row:hover .row-action {
+        color: #FF2D2D;
+    }
+    .last-file-row:disabled {
+        opacity: 0.5;
+    }
+    .last-file-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 12px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .last-file-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1px;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.recorder",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("toggle-rec", "r", "Toggle recording (no UI)"),
+            ("start", "S", "Start recording"),
+            ("start-region", "R", "Start recording region"),
+            ("stop", "X", "Stop recording"),
+            ("daemon", "d", "Daemon mode"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingRecorderWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        w = self.window
+
+        if "quit" in opts:
+            self.quit()
+            return 0
+
+        def cli_start(region=False, audio=False):
+            def worker():
+                ok, err = Recorder.start(region=region, audio=audio)
+                if ok:
+                    send_recording_started_notification(region, audio)
+                else:
+                    notify_error(
+                        "Recording failed",
+                        err or "Unknown error",
+                        app="nothing-recorder",
+                    )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def cli_stop():
+            def worker():
+                out_path = Recorder.output_path()
+                Recorder.stop()
+                send_recording_stopped_notification(out_path)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        if "start" in opts:
+            cli_start()
+            return 0
+        if "start-region" in opts:
+            cli_start(region=True)
+            return 0
+        if "stop" in opts:
+            cli_stop()
+            return 0
+        if "toggle-rec" in opts:
+            if Recorder.is_recording():
+                cli_stop()
+            else:
+                cli_start()
+            return 0
+        if "hide" in opts:
+            w.hide_popup()
+        elif "show" in opts:
+            w.show_popup()
+        elif "toggle" in opts:
+            w.toggle_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            w.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingRecorderApp()
+    sys.exit(app.run(sys.argv))

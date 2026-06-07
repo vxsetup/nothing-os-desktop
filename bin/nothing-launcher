@@ -1,0 +1,1381 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Launcher
+Unified with control/volume/network/etc design language:
+  - red glyph dot in header + result counter
+  - dot-matrix search prompt indicator
+  - flat app rows with squircle icon, name, comment
+  - selected row = red accent bar + slight wash
+  - "frequently used" red dot marker
+  - keyboard nav (↑↓, PgUp/PgDn, Home/End, Enter, Esc)
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import json
+import math
+import re
+import shlex
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_notify import notify_error
+except ImportError:
+
+    def notify_error(*a, **kw):
+        return None
+
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+WHITE_04 = (1.0, 1.0, 1.0, 0.04)
+
+CARD_WIDTH = 560
+CARD_HEIGHT = 640
+USAGE_FILE = Path.home() / ".local" / "state" / "nothing-launcher" / "usage.json"
+LOG_FILE = Path("/tmp/nothing-launcher.log")
+
+
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Env / launch helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def _child_env():
+    env = os.environ.copy()
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k not in env or not env[k]:
+                    env[k] = v
+    except Exception:
+        pass
+    return env
+
+
+def _detect_locales():
+    raw = (
+        os.environ.get("LC_MESSAGES")
+        or os.environ.get("LC_ALL")
+        or os.environ.get("LANG")
+        or "C"
+    )
+    raw = raw.split(".")[0]
+    if not raw or raw in ("C", "POSIX"):
+        return []
+    modifier = ""
+    if "@" in raw:
+        raw, modifier = raw.split("@", 1)
+    lang = raw
+    country = ""
+    if "_" in raw:
+        lang, country = raw.split("_", 1)
+    candidates = []
+    if lang and country and modifier:
+        candidates.append(f"{lang}_{country}@{modifier}")
+    if lang and country:
+        candidates.append(f"{lang}_{country}")
+    if lang and modifier:
+        candidates.append(f"{lang}@{modifier}")
+    if lang:
+        candidates.append(lang)
+    seen = set()
+    out = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+LOCALES = _detect_locales()
+
+
+def clean_exec(exec_string):
+    if not exec_string:
+        return ""
+    s = exec_string.strip()
+    s = re.sub(r"@@u\s+%[uU]\s+@@", "", s)
+    s = re.sub(r"@@\s+%[fFuU]\s+@@", "", s)
+    s = re.sub(r"\s+@@\s*", " ", s)
+    s = re.sub(r"%[fFuUdDnNickvm]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def expand_exec(s):
+    try:
+        argv = shlex.split(s, posix=True)
+        return [os.path.expanduser(os.path.expandvars(a)) for a in argv]
+    except ValueError:
+        return s.split()
+
+
+# ═════════════════════════════════════════════════════════════
+#  DesktopApp model
+# ═════════════════════════════════════════════════════════════
+
+
+class DesktopApp:
+    __slots__ = (
+        "id",
+        "desktop_id",
+        "name",
+        "comment",
+        "icon",
+        "exec",
+        "terminal",
+        "categories",
+        "keywords",
+        "no_display",
+        "usage",
+        "path",
+        "try_exec",
+        "working_dir",
+        "dbus_activatable",
+    )
+
+    def __init__(self):
+        self.id = ""
+        self.desktop_id = ""
+        self.name = ""
+        self.comment = ""
+        self.icon = ""
+        self.exec = ""
+        self.terminal = False
+        self.categories = []
+        self.keywords = []
+        self.no_display = False
+        self.usage = 0
+        self.path = ""
+        self.try_exec = ""
+        self.working_dir = ""
+        self.dbus_activatable = False
+
+    def secondary_text(self):
+        return self.comment or ", ".join(self.categories[:2])
+
+    def launch(self):
+        log(f"=== launching: {self.name!r}")
+        env = _child_env()
+        cmd = clean_exec(self.exec)
+        if not cmd:
+            return False
+        if self.terminal:
+            term = env.get("TERMINAL") or self._find_terminal()
+            cmd = f"{term} -e {cmd}"
+        self._maybe_chmod_appimage(cmd)
+
+        if shutil.which("hyprctl") and self._try_hyprctl(cmd, env):
+            log("    ✓ hyprctl dispatch exec")
+            return True
+        if self._try_setsid_sh(cmd, env):
+            log("    ✓ setsid sh")
+            return True
+        if self._try_subprocess(cmd, env):
+            log("    ✓ direct subprocess")
+            return True
+        log("    ✗ ALL strategies failed")
+        return False
+
+    def _try_hyprctl(self, cmd, env):
+        try:
+            cwd = (
+                self.working_dir
+                if self.working_dir and os.path.isdir(self.working_dir)
+                else None
+            )
+            r = subprocess.run(
+                ["hyprctl", "dispatch", "exec", cmd],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                env=env,
+                cwd=cwd,
+            )
+            if r.returncode != 0:
+                return False
+            return "ok" in r.stdout.lower()
+        except Exception:
+            return False
+
+    def _try_setsid_sh(self, cmd, env):
+        try:
+            cwd = (
+                self.working_dir
+                if self.working_dir and os.path.isdir(self.working_dir)
+                else None
+            )
+            if shutil.which("setsid"):
+                argv = ["setsid", "-f", "sh", "-c", cmd]
+            else:
+                argv = ["sh", "-c", cmd + " &"]
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                env=env,
+                cwd=cwd,
+            )
+            try:
+                rc = proc.wait(timeout=0.5)
+                return rc == 0
+            except subprocess.TimeoutExpired:
+                return True
+        except Exception:
+            return False
+
+    def _try_subprocess(self, cmd, env):
+        try:
+            argv = expand_exec(cmd)
+            if not argv:
+                return False
+            exe = argv[0]
+            if not os.path.isabs(exe):
+                resolved = shutil.which(exe, path=env.get("PATH"))
+                if resolved:
+                    argv[0] = resolved
+                else:
+                    return False
+            cwd = (
+                self.working_dir
+                if self.working_dir and os.path.isdir(self.working_dir)
+                else None
+            )
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                env=env,
+                cwd=cwd,
+            )
+            try:
+                rc = proc.wait(timeout=0.5)
+                return rc == 0
+            except subprocess.TimeoutExpired:
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _maybe_chmod_appimage(cmd):
+        try:
+            for p in shlex.split(cmd):
+                p_exp = os.path.expanduser(os.path.expandvars(p))
+                if p_exp.lower().endswith(".appimage") and os.path.exists(p_exp):
+                    st = os.stat(p_exp)
+                    if not (st.st_mode & 0o111):
+                        os.chmod(p_exp, st.st_mode | 0o755)
+                    break
+        except Exception:
+            pass
+
+    @staticmethod
+    def _find_terminal():
+        for t in (
+            "foot",
+            "alacritty",
+            "kitty",
+            "wezterm",
+            "xterm",
+            "gnome-terminal",
+            "konsole",
+        ):
+            if shutil.which(t):
+                return t
+        return "xterm"
+
+
+# ═════════════════════════════════════════════════════════════
+#  AppDB — scan .desktop files
+# ═════════════════════════════════════════════════════════════
+
+
+class AppDB:
+    @staticmethod
+    def _xdg_data_dirs():
+        seen = set()
+        out = []
+        home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+        candidates = [home]
+        sys_dirs = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+        candidates.extend(sys_dirs.split(":"))
+        candidates.append("/var/lib/flatpak/exports/share")
+        candidates.append(os.path.expanduser("~/.local/share/flatpak/exports/share"))
+        candidates.append("/var/lib/snapd/desktop")
+        for d in candidates:
+            if not d:
+                continue
+            apps_dir = Path(d) / "applications"
+            try:
+                key = str(apps_dir.resolve())
+            except Exception:
+                key = str(apps_dir)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(apps_dir)
+        return out
+
+    @staticmethod
+    def _parse_desktop(path):
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            return None
+        in_main = False
+        type_val = None
+        no_display = False
+        try_exec = ""
+        not_show_in = None
+        exec_val = ""
+        icon_val = ""
+        terminal = False
+        categories = []
+        keywords = []
+        working_dir = ""
+        dbus_activatable = False
+        names = {}
+        comments = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("["):
+                if in_main:
+                    break
+                in_main = line == "[Desktop Entry]"
+                continue
+            if not in_main or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            loc = ""
+            m = re.match(r"^([A-Za-z\-]+)\[(.+)\]$", key)
+            if m:
+                base_key = m.group(1)
+                loc = m.group(2)
+            else:
+                base_key = key
+            if base_key == "Type":
+                type_val = val
+            elif base_key == "Name":
+                names[loc] = val
+            elif base_key == "Comment":
+                comments[loc] = val
+            elif base_key == "Icon":
+                if not loc:
+                    icon_val = val
+            elif base_key == "Exec":
+                if not loc:
+                    exec_val = val
+            elif base_key == "TryExec":
+                if not loc:
+                    try_exec = val
+            elif base_key == "Path":
+                if not loc:
+                    working_dir = os.path.expanduser(val)
+            elif base_key == "Terminal":
+                if not loc:
+                    terminal = val.lower() == "true"
+            elif base_key == "DBusActivatable":
+                if not loc:
+                    dbus_activatable = val.lower() == "true"
+            elif base_key == "Categories":
+                if not loc:
+                    categories = [c for c in val.split(";") if c]
+            elif base_key == "Keywords":
+                if not loc:
+                    keywords = [k for k in val.split(";") if k]
+            elif base_key == "NoDisplay":
+                if not loc and val.lower() == "true":
+                    no_display = True
+            elif base_key == "Hidden":
+                if not loc and val.lower() == "true":
+                    no_display = True
+            elif base_key == "NotShowIn":
+                if not loc:
+                    not_show_in = [x for x in val.split(";") if x]
+
+        if type_val and type_val != "Application":
+            return None
+        if no_display:
+            return None
+        if not exec_val:
+            return None
+        current_desktops = AppDB._current_desktops()
+        if not_show_in:
+            if any(d in not_show_in for d in current_desktops):
+                return None
+        name = AppDB._pick_localized(names)
+        comment = AppDB._pick_localized(comments)
+        if not name:
+            return None
+        app = DesktopApp()
+        app.id = path.stem
+        app.desktop_id = path.name
+        app.path = str(path)
+        app.name = name
+        app.comment = comment or ""
+        app.icon = icon_val
+        app.exec = exec_val
+        app.try_exec = try_exec
+        app.working_dir = working_dir
+        app.terminal = terminal
+        app.dbus_activatable = dbus_activatable
+        app.categories = categories
+        app.keywords = keywords
+        app.no_display = False
+        return app
+
+    @staticmethod
+    def _pick_localized(d):
+        if not d:
+            return ""
+        for loc in LOCALES:
+            if loc in d:
+                return d[loc]
+        if "" in d:
+            return d[""]
+        return next(iter(d.values()), "")
+
+    @staticmethod
+    def _current_desktops():
+        raw = os.environ.get("XDG_CURRENT_DESKTOP", "")
+        if not raw:
+            return ["Hyprland"]
+        return [x for x in raw.split(":") if x]
+
+    @staticmethod
+    def _load_usage():
+        if not USAGE_FILE.exists():
+            return {}
+        try:
+            return json.loads(USAGE_FILE.read_text())
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_usage(usage):
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            USAGE_FILE.write_text(json.dumps(usage))
+        except Exception:
+            pass
+
+    @staticmethod
+    def bump_usage(app_id):
+        usage = AppDB._load_usage()
+        usage[app_id] = usage.get(app_id, 0) + 1
+        AppDB._save_usage(usage)
+
+    @staticmethod
+    def scan():
+        apps_by_id = {}
+        usage = AppDB._load_usage()
+        for d in AppDB._xdg_data_dirs():
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for f in d.rglob("*.desktop"):
+                    if f.name in apps_by_id:
+                        continue
+                    app = AppDB._parse_desktop(f)
+                    if not app:
+                        continue
+                    app.usage = usage.get(app.id, 0)
+                    apps_by_id[app.desktop_id] = app
+            except Exception as e:
+                log(f"scan {d}: {e}")
+        result = list(apps_by_id.values())
+        result.sort(key=lambda a: (-a.usage, a.name.lower()))
+        return result
+
+
+# ═════════════════════════════════════════════════════════════
+#  Fuzzy search
+# ═════════════════════════════════════════════════════════════
+
+
+def fuzzy_score(query, text):
+    if not query:
+        return 0
+    q = query.lower()
+    t = (text or "").lower()
+    if not t:
+        return -1
+    if q in t:
+        return 1000 - t.index(q) * 2
+    score = 0
+    qi = 0
+    last_pos = -2
+    for ti, ch in enumerate(t):
+        if qi < len(q) and ch == q[qi]:
+            if ti == last_pos + 1:
+                score += 5
+            else:
+                score += 1
+            if ti == 0 or t[ti - 1] in " -_/":
+                score += 3
+            last_pos = ti
+            qi += 1
+    if qi < len(q):
+        return -1
+    return score
+
+
+def search_apps(apps, query):
+    if not query:
+        return apps[:200]
+    scored = []
+    for app in apps:
+        best = -1
+        for field, weight in [
+            (app.name, 2.0),
+            (app.id, 1.2),
+            (app.comment, 0.8),
+            (" ".join(app.keywords), 1.0),
+            (" ".join(app.categories), 0.5),
+        ]:
+            s = fuzzy_score(query, field)
+            if s > 0:
+                best = max(best, s * weight)
+        if best > 0:
+            best += app.usage * 2
+            scored.append((best, app))
+    scored.sort(key=lambda x: -x[0])
+    return [a for _, a in scored[:80]]
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_search(cr, cx, cy, active=False, size=22, color=None):
+    """Magnifier glyph."""
+    if color is None:
+        color = WHITE_85
+    if len(color) == 3:
+        color = (*color, 1.0)
+    cr.set_source_rgba(*color)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.32
+    # Circle
+    cr.arc(cx - s * 0.20, cy - s * 0.20, s * 0.70, 0, 2 * math.pi)
+    cr.stroke()
+    # Handle
+    cr.move_to(cx + s * 0.35, cy + s * 0.35)
+    cr.line_to(cx + s * 0.85, cy + s * 0.85)
+    cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Squircle fallback icon
+# ═════════════════════════════════════════════════════════════
+
+
+class FallbackIcon(Gtk.DrawingArea):
+    def __init__(self, letter="?"):
+        super().__init__()
+        self.letter = (letter or "?")[:1].upper()
+        self.set_content_width(36)
+        self.set_content_height(36)
+        self.set_draw_func(self._draw)
+
+    def _draw(self, area, cr, w, h):
+        radius = 8
+        # Subtle fill
+        round_rect(cr, 0, 0, w, h, radius)
+        cr.set_source_rgba(*WHITE_06)
+        cr.fill()
+        # Border
+        round_rect(cr, 0.5, 0.5, w - 1, h - 1, radius)
+        cr.set_source_rgba(*WHITE_12)
+        cr.set_line_width(1)
+        cr.stroke()
+        # Letter
+        cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(16)
+        cr.set_source_rgba(*WHITE_85)
+        ext = cr.text_extents(self.letter)
+        cr.move_to((w - ext.width) / 2 - ext.x_bearing, (h + ext.height) / 2 - 1)
+        cr.show_text(self.letter)
+
+
+def make_app_icon(app):
+    icon_name = app.icon or ""
+    img = None
+    if icon_name:
+        if icon_name.startswith("/") and os.path.exists(icon_name):
+            try:
+                img = Gtk.Image.new_from_file(icon_name)
+                img.set_pixel_size(36)
+            except Exception:
+                img = None
+        if img is None:
+            try:
+                display = Gdk.Display.get_default()
+                theme = Gtk.IconTheme.get_for_display(display)
+                if theme.has_icon(icon_name):
+                    img = Gtk.Image.new_from_icon_name(icon_name)
+                    img.set_pixel_size(36)
+            except Exception:
+                img = None
+    if img is None:
+        return FallbackIcon(letter=app.name[:1] if app.name else "?")
+    img.set_size_request(36, 36)
+    return img
+
+
+# ═════════════════════════════════════════════════════════════
+#  AppRow — flat, with full-height accent bar
+# ═════════════════════════════════════════════════════════════
+
+
+class AppRow(Gtk.Box):
+    def __init__(self, app, on_activate, is_frequent=False):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.add_css_class("app-row")
+        self.app = app
+        self.on_activate = on_activate
+        self._selected = False
+        self._is_frequent = is_frequent
+
+        # Left accent bar — full row height, hidden until selected
+        self.accent_bar = Gtk.DrawingArea()
+        self.accent_bar.set_content_width(3)
+        self.accent_bar.set_vexpand(True)
+        self.accent_bar.set_valign(Gtk.Align.FILL)
+        self._accent_visible = False
+        self.accent_bar.set_draw_func(self._draw_accent)
+        self.append(self.accent_bar)
+
+        # Content area with consistent padding
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        content.set_margin_top(10)
+        content.set_margin_bottom(10)
+        content.set_margin_start(14)
+        content.set_margin_end(14)
+        content.set_hexpand(True)
+
+        # Icon container — fixed 36x36 so all rows align identically
+        icon_container = Gtk.Box()
+        icon_container.set_size_request(36, 36)
+        icon_container.set_halign(Gtk.Align.CENTER)
+        icon_container.set_valign(Gtk.Align.CENTER)
+        icon = make_app_icon(app)
+        icon.set_halign(Gtk.Align.CENTER)
+        icon.set_valign(Gtk.Align.CENTER)
+        icon_container.append(icon)
+        content.append(icon_container)
+
+        # Info column
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        name_lbl = Gtk.Label(label=app.name, xalign=0)
+        name_lbl.add_css_class("row-name")
+        name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        info.append(name_lbl)
+
+        sec = app.secondary_text()
+        if sec:
+            sec_lbl = Gtk.Label(label=sec, xalign=0)
+            sec_lbl.add_css_class("row-secondary")
+            sec_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            info.append(sec_lbl)
+        content.append(info)
+
+        # Right side: optional freq dot + chevron
+        right_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        right_box.set_valign(Gtk.Align.CENTER)
+
+        if self._is_frequent:
+            # Small red dot indicator (12px container)
+            freq_dot = Gtk.DrawingArea()
+            freq_dot.set_content_width(6)
+            freq_dot.set_content_height(6)
+            freq_dot.set_valign(Gtk.Align.CENTER)
+
+            def _draw_freq_dot(a, cr, w, h):
+                cr.set_source_rgb(*RED)
+                cr.arc(w / 2, h / 2, min(w, h) / 2, 0, 2 * math.pi)
+                cr.fill()
+
+            freq_dot.set_draw_func(_draw_freq_dot)
+            right_box.append(freq_dot)
+
+        chevron = Gtk.Label(label="›", xalign=1)
+        chevron.add_css_class("row-chevron")
+        chevron.set_valign(Gtk.Align.CENTER)
+        right_box.append(chevron)
+
+        content.append(right_box)
+
+        self.append(content)
+
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *a: self.on_activate(self.app))
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", lambda *a: self.add_css_class("hover"))
+        hover.connect("leave", lambda *a: self.remove_css_class("hover"))
+        self.add_controller(hover)
+
+    def _draw_accent(self, area, cr, w, h):
+        if not self._accent_visible:
+            return
+        # Full height accent bar with pill rounded ends
+        round_rect(cr, 0, 6, w, h - 12, w / 2)
+        cr.set_source_rgb(*RED)
+        cr.fill()
+
+    def set_selected(self, sel):
+        self._selected = sel
+        if sel:
+            self.add_css_class("selected")
+        else:
+            self.remove_css_class("selected")
+        self._accent_visible = sel
+        self.accent_bar.queue_draw()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Search prompt with icon
+# ═════════════════════════════════════════════════════════════
+
+
+class SearchBox(Gtk.Box):
+    """Search input with magnifier icon in unified card."""
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.add_css_class("search-card")
+        self.set_size_request(-1, 48)
+
+        # Icon — drawn area inside left padding
+        icon_area = Gtk.DrawingArea()
+        icon_area.set_content_width(20)
+        icon_area.set_content_height(20)
+        icon_area.set_valign(Gtk.Align.CENTER)
+        icon_area.set_margin_start(18)
+        icon_area.set_margin_end(12)
+        icon_area.set_draw_func(
+            lambda a, cr, w, h: _draw_search(cr, w / 2, h / 2, size=20, color=WHITE_50)
+        )
+        self.append(icon_area)
+
+        self.entry = Gtk.Entry()
+        self.entry.add_css_class("search-entry-clean")
+        self.entry.set_placeholder_text("Type to search…")
+        self.entry.set_hexpand(True)
+        self.entry.set_has_frame(False)  # remove default GTK frame
+        self.append(self.entry)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingLauncherWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._all_apps = []
+        self._visible_apps = []
+        self._selected_index = 0
+        self._row_widgets = []
+
+        self.set_title("nothing-launcher")
+        self.set_default_size(CARD_WIDTH, CARD_HEIGHT)
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-launcher")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        card_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card_outer.add_css_class("card-scroller")
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(14)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="LAUNCHER", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+        self.count_lbl = Gtk.Label(label="—")
+        self.count_lbl.add_css_class("header-meta")
+        header.append(self.count_lbl)
+        card.append(header)
+
+        # Toast (failure msg)
+        self.toast = Gtk.Label(xalign=0)
+        self.toast.add_css_class("toast-clean")
+        self.toast.set_margin_start(24)
+        self.toast.set_margin_end(24)
+        self.toast.set_margin_bottom(10)
+        self.toast.set_visible(False)
+        card.append(self.toast)
+
+        # ─── Search box ───
+        search_wrap = Gtk.Box()
+        search_wrap.set_margin_start(20)
+        search_wrap.set_margin_end(20)
+        search_wrap.set_margin_bottom(12)
+        self.search_box = SearchBox()
+        self.entry = self.search_box.entry
+        self.entry.connect("changed", self._on_search_changed)
+        self.entry.connect("activate", self._on_activate_selected)
+        self.search_box.set_hexpand(True)
+        search_wrap.append(self.search_box)
+        card.append(search_wrap)
+
+        # ─── List ───
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("list-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+        scroll.set_margin_start(20)
+        scroll.set_margin_end(20)
+        scroll.set_margin_bottom(20)
+
+        self.list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.list_box.add_css_class("list-flat")
+
+        self.empty_lbl = Gtk.Label(label="LOADING…")
+        self.empty_lbl.add_css_class("empty-label-clean")
+        self.empty_lbl.set_margin_top(60)
+        self.empty_lbl.set_margin_bottom(60)
+        self.list_box.append(self.empty_lbl)
+
+        scroll.set_child(self.list_box)
+        self.scroll = scroll
+        card.append(scroll)
+
+        card_outer.append(card)
+        outer.append(card_outer)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel)
+        scroll.add_controller(wheel)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+        threading.Thread(target=self._scan_apps, daemon=True).start()
+
+    def _scan_apps(self):
+        try:
+            apps = AppDB.scan()
+        except Exception as e:
+            log(f"scan error: {e}")
+            apps = []
+        GLib.idle_add(self._apply_apps, apps)
+
+    def _apply_apps(self, apps):
+        self._all_apps = apps
+        self._update_results(self.entry.get_text())
+        self.entry.grab_focus()
+        return False
+
+    def _on_search_changed(self, entry):
+        self._update_results(entry.get_text())
+
+    def _update_results(self, query):
+        self._visible_apps = search_apps(self._all_apps, query)
+        self._selected_index = 0
+        self.count_lbl.set_text(str(len(self._visible_apps)))
+
+        # Compute "frequent" set — top 5 most used apps overall
+        frequent_ids = self._compute_frequent_ids()
+
+        while child := self.list_box.get_first_child():
+            self.list_box.remove(child)
+        self._row_widgets = []
+
+        if not self._visible_apps:
+            self.empty_lbl.set_text("NO RESULTS" if query else "NO APPLICATIONS")
+            self.list_box.append(self.empty_lbl)
+            self.empty_lbl.set_visible(True)
+        else:
+            self.empty_lbl.set_visible(False)
+            for i, app in enumerate(self._visible_apps):
+                is_freq = app.id in frequent_ids
+                row = AppRow(app, self._launch_app, is_frequent=is_freq)
+                self.list_box.append(row)
+                self._row_widgets.append(row)
+                if i < len(self._visible_apps) - 1:
+                    div = Gtk.Box()
+                    div.add_css_class("row-divider-inline")
+                    div.set_margin_start(20)
+                    div.set_margin_end(14)
+                    div.set_size_request(-1, 1)
+                    self.list_box.append(div)
+        self._refresh_selection()
+
+    def _compute_frequent_ids(self):
+        """Return set of app IDs that are top-N by usage (min threshold 3)."""
+        used = [a for a in self._all_apps if a.usage >= 3]
+        used.sort(key=lambda a: -a.usage)
+        top = used[:5]
+        return {a.id for a in top}
+
+    def _refresh_selection(self):
+        for i, row in enumerate(self._row_widgets):
+            row.set_selected(i == self._selected_index)
+        if 0 <= self._selected_index < len(self._row_widgets):
+            row = self._row_widgets[self._selected_index]
+            GLib.idle_add(self._scroll_to_row, row)
+
+    def _scroll_to_row(self, row):
+        try:
+            adj = self.scroll.get_vadjustment()
+            if not adj:
+                return False
+            alloc = row.get_allocation()
+            if alloc.height == 0:
+                return False
+            ry = alloc.y
+            rb = ry + alloc.height
+            page = adj.get_page_size()
+            value = adj.get_value()
+            if ry < value:
+                adj.set_value(max(adj.get_lower(), ry - 4))
+            elif rb > value + page:
+                adj.set_value(min(adj.get_upper() - page, rb - page + 4))
+        except Exception:
+            pass
+        return False
+
+    def _on_wheel(self, c, dx, dy):
+        adj = self.scroll.get_vadjustment()
+        if not adj:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _on_key(self, c, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        if keyval == Gdk.KEY_Down:
+            if self._visible_apps:
+                self._selected_index = min(
+                    self._selected_index + 1, len(self._visible_apps) - 1
+                )
+                self._refresh_selection()
+            return True
+        if keyval == Gdk.KEY_Up:
+            if self._visible_apps:
+                self._selected_index = max(self._selected_index - 1, 0)
+                self._refresh_selection()
+            return True
+        if keyval == Gdk.KEY_Page_Down:
+            if self._visible_apps:
+                self._selected_index = min(
+                    self._selected_index + 8, len(self._visible_apps) - 1
+                )
+                self._refresh_selection()
+            return True
+        if keyval == Gdk.KEY_Page_Up:
+            if self._visible_apps:
+                self._selected_index = max(self._selected_index - 8, 0)
+                self._refresh_selection()
+            return True
+        if keyval == Gdk.KEY_Home:
+            if self._visible_apps:
+                self._selected_index = 0
+                self._refresh_selection()
+            return True
+        if keyval == Gdk.KEY_End:
+            if self._visible_apps:
+                self._selected_index = len(self._visible_apps) - 1
+                self._refresh_selection()
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._on_activate_selected(None)
+            return True
+        return False
+
+    def _on_activate_selected(self, _entry):
+        if 0 <= self._selected_index < len(self._visible_apps):
+            app = self._visible_apps[self._selected_index]
+            self._launch_app(app)
+
+    def _launch_app(self, app):
+        def worker():
+            ok = app.launch()
+            if ok:
+                AppDB.bump_usage(app.id)
+                GLib.idle_add(self.hide_popup)
+            else:
+                GLib.idle_add(self._show_toast, f"FAILED · {app.name}")
+                notify_error("Launch failed", app.name, app="nothing-launcher")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_toast(self, msg):
+        self.toast.set_text(msg)
+        self.toast.set_visible(True)
+        GLib.timeout_add(4000, lambda: (self.toast.set_visible(False), False)[1])
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-launcher")
+        self.entry.set_text("")
+        self.toast.set_visible(False)
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+        GLib.idle_add(lambda: (self.entry.grab_focus(), False)[1])
+        threading.Thread(target=self._scan_apps, daemon=True).start()
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingLauncherApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+
+    /* Toast — inline failure indicator */
+    .toast-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: #FF2D2D;
+        background-color: rgba(255, 45, 45, 0.08);
+        border: 1px solid rgba(255, 45, 45, 0.30);
+        border-radius: 10px;
+        padding: 10px 14px;
+        letter-spacing: 1.5px;
+    }
+
+    /* Search card — unified background, single border */
+    .search-card {
+        background-color: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        transition: border-color 120ms ease, background-color 120ms ease;
+    }
+    .search-card:focus-within {
+        border-color: rgba(255, 45, 45, 0.40);
+        background-color: rgba(255, 255, 255, 0.06);
+    }
+
+    /* Entry inside search card — fully transparent, no own frame */
+    .search-entry-clean,
+    .search-entry-clean text,
+    .search-entry-clean > text {
+        background: transparent;
+        background-color: transparent;
+        background-image: none;
+        color: #FFFFFF;
+        font-family: "Inter", sans-serif;
+        font-size: 14px;
+        font-weight: 500;
+        padding: 0 14px 0 0;
+        border: none;
+        outline: none;
+        box-shadow: none;
+        caret-color: #FF2D2D;
+        letter-spacing: 0.1px;
+        min-height: 46px;
+    }
+    .search-entry-clean:focus,
+    .search-entry-clean:focus-within,
+    .search-entry-clean text:focus {
+        outline: none;
+        box-shadow: none;
+        background: transparent;
+        background-color: transparent;
+    }
+    .search-entry-clean placeholder,
+    .search-entry-clean text placeholder {
+        color: rgba(255, 255, 255, 0.30);
+    }
+    .search-entry-clean selection {
+        background-color: rgba(255, 45, 45, 0.35);
+        color: #FFFFFF;
+    }
+    /* App rows — flat, no internal background */
+
+    .app-row {
+        background: transparent;
+        background-color: transparent;
+        padding: 0;
+        border-radius: 10px;
+        transition: background-color 120ms ease;
+    }
+    .app-row.hover {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+    .app-row.selected {
+        background-color: rgba(255, 45, 45, 0.08);
+    }
+
+    .row-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 14px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .row-secondary {
+        font-family: "Inter", sans-serif;
+        font-weight: 400;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 0.1px;
+    }
+    .row-mac {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 8px;
+        color: #FF2D2D;
+        letter-spacing: 1.5px;
+    }
+    .row-chevron {
+        font-family: "Inter", sans-serif;
+        font-weight: 400;
+        font-size: 18px;
+        color: rgba(255, 255, 255, 0.25);
+        min-width: 14px;
+    }
+    .app-row.selected .row-chevron {
+        color: #FF2D2D;
+    }
+    .app-row.hover .row-chevron {
+        color: rgba(255, 255, 255, 0.55);
+    }
+
+    /* Hide scrollbar */
+    .list-scroller scrollbar,
+    .list-scroller scrollbar slider {
+        opacity: 0;
+        min-width: 0;
+        min-height: 0;
+        background: transparent;
+    }
+    .list-scroller undershoot,
+    .list-scroller overshoot {
+        background: none;
+        box-shadow: none;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.launcher",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("daemon", "d", "Run as daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingLauncherWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if "quit" in opts:
+            self.quit()
+            return 0
+        if "hide" in opts:
+            self.window.hide_popup()
+        elif "show" in opts:
+            self.window.show_popup()
+        elif "toggle" in opts:
+            self.window.toggle_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    app = NothingLauncherApp()
+    sys.exit(app.run(sys.argv))

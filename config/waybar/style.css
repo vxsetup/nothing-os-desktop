@@ -1,0 +1,312 @@
+/* ═══════════════════════════════════════════════════════════
+   Nothing OS · Waybar · YOUR BASE + micro-refinements
+   
+   Kept: structure, sizes, fonts, icons, layout
+   Added: subtle animations, refined hovers, polished details
+   ═══════════════════════════════════════════════════════════ */
+
+* {
+    font-family: "Inter", "SF Pro Display", "Symbols Nerd Font", sans-serif;
+    font-weight: 500;
+    font-size: 13px;
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+}
+
+@keyframes pulse {
+    from { opacity: 1.0; }
+    to   { opacity: 0.5; }
+}
+
+@keyframes rec-blink {
+    from { background-color: rgba(255, 45, 45, 0.12); }
+    to   { background-color: rgba(255, 45, 45, 0.28); }
+}
+
+window#waybar {
+    background: rgba(11, 11, 12, 0.94);
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    color: #F2F2F2;
+}
+
+window#waybar.hidden { opacity: 0; }
+
+.modules-left   { padding-left: 4px; }
+.modules-right  { padding-right: 2px; }
+.modules-center { padding: 0; }
+
+#workspaces,
+#window,
+#custom-recorder,
+#language,
+#pulseaudio,
+#bluetooth,
+#network,
+#battery,
+#clock,
+#custom-control,
+#custom-separator {
+    padding: 0 10px;
+    margin: 4px 2px;
+    border-radius: 8px;
+    background: transparent;
+    transition: background 150ms ease, color 150ms ease;
+}
+
+#pulseaudio:hover,
+#bluetooth:hover,
+#network:hover,
+#battery:hover,
+#clock:hover,
+#language:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+/* ─── WORKSPACES ──────────────────────────────────────── */
+
+/* ─── WORKSPACES — smooth, no layout jitter ───────────── */
+
+#workspaces { 
+    padding: 0 4px;
+    background: transparent;
+}
+
+#workspaces button {
+    color: #48484A;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 0 9px;
+    margin: 4px 2px;
+    border-radius: 7px;
+    background-color: transparent;
+    transition: 
+        background-color 280ms cubic-bezier(0.4, 0, 0.2, 1),
+        color 200ms ease,
+        min-width 320ms cubic-bezier(0.34, 1.30, 0.64, 1),
+        box-shadow 280ms ease;
+    min-width: 24px;
+}
+
+#workspaces button:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+    color: #C7C7CC;
+}
+
+#workspaces button.occupied {
+    color: #8E8E93;
+    box-shadow: inset 0 -2px 0 rgba(255, 255, 255, 0.10);
+}
+
+#workspaces button.occupied:hover {
+    color: #FFFFFF;
+    background-color: rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 -2px 0 rgba(255, 255, 255, 0.20);
+}
+
+#workspaces button.active {
+    background-color: #FF2D2D;
+    color: #FFFFFF;
+    font-weight: 700;
+    min-width: 32px;
+    box-shadow: 
+        inset 0 1px 0 rgba(255, 255, 255, 0.18),
+        0 0 0 rgba(255, 45, 45, 0);
+    animation: active-glow 600ms ease-out;
+}
+
+#workspaces button.active:hover {
+    background-color: #FF4747;
+    box-shadow: 
+        inset 0 1px 0 rgba(255, 255, 255, 0.25),
+        0 0 10px rgba(255, 45, 45, 0.40);
+}
+
+#workspaces button.urgent {
+    background-color: rgba(255, 45, 45, 0.18);
+    color: #FF2D2D;
+    animation: urgent-pulse 1.4s ease-in-out infinite alternate;
+}
+
+@keyframes active-glow {
+    0% {
+        background-color: rgba(255, 45, 45, 0.50);
+        box-shadow: 
+            inset 0 1px 0 rgba(255, 255, 255, 0.30),
+            0 0 16px rgba(255, 45, 45, 0.60);
+    }
+    100% {
+        background-color: #FF2D2D;
+        box-shadow: 
+            inset 0 1px 0 rgba(255, 255, 255, 0.18),
+            0 0 0 rgba(255, 45, 45, 0);
+    }
+}
+
+@keyframes urgent-pulse {
+    from { 
+        background-color: rgba(255, 45, 45, 0.14);
+        box-shadow: 0 0 0 rgba(255, 45, 45, 0);
+    }
+    to   { 
+        background-color: rgba(255, 45, 45, 0.32);
+        box-shadow: 0 0 8px rgba(255, 45, 45, 0.50);
+    }
+}
+
+/* ─── WINDOW ──────────────────────────────────────────── */
+
+#window {
+    color: #636366;
+    font-weight: 400;
+    font-size: 12px;
+    padding: 0 16px;
+}
+
+window#waybar.empty #window {
+    padding: 0;
+    margin: 0;
+    min-width: 0;
+}
+
+/* ─── RECORDER ────────────────────────────────────────── */
+
+#custom-recorder { 
+    padding: 0; 
+    margin: 0; 
+    min-width: 0; 
+}
+
+#custom-recorder.recording {
+    color: #FF2D2D;
+    font-size: 10px;
+    padding: 0 9px;
+    margin: 5px 2px;
+    background: rgba(255, 45, 45, 0.12);
+    border-radius: 7px;
+    animation: rec-blink 1s ease-in-out infinite alternate;
+}
+
+#custom-recorder.idle {
+    padding: 0;
+    margin: 0;
+    min-width: 0;
+    font-size: 0;
+}
+
+/* ─── LANGUAGE ────────────────────────────────────────── */
+
+#language {
+    color: #8E8E93;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    padding: 0 8px;
+    min-width: 22px;
+}
+
+#language:hover { color: #FFFFFF; }
+
+/* ─── AUDIO ───────────────────────────────────────────── */
+
+#pulseaudio       { color: #E0E0E3; font-weight: 500; padding: 0 10px; }
+#pulseaudio:hover { color: #FFFFFF; }
+#pulseaudio.muted { color: #48484A; }
+
+/* ─── BLUETOOTH ───────────────────────────────────────── */
+
+#bluetooth       { color: #E0E0E3; font-weight: 500; font-size: 12px; padding: 0 8px; }
+#bluetooth:hover { color: #FFFFFF; }
+#bluetooth.connected { color: #FFFFFF; }
+
+#bluetooth.disabled,
+#bluetooth.off {
+    color: #48484A;
+    padding: 0;
+    margin: 0;
+    min-width: 0;
+    font-size: 0;
+}
+
+/* ─── NETWORK ─────────────────────────────────────────── */
+
+#network              { color: #E0E0E3; font-weight: 500; padding: 0 10px; }
+#network:hover        { color: #FFFFFF; }
+#network.disconnected { color: #48484A; }
+
+/* ─── BATTERY ─────────────────────────────────────────── */
+
+#battery {
+    color: #E0E0E3;
+    font-weight: 500;
+    padding: 0 10px;
+    min-width: 52px;
+}
+#battery.charging                 { color: #30D158; }
+#battery.warning:not(.charging)   { color: #FF9F0A; }
+#battery.critical:not(.charging)  { 
+    color: #FF2D2D; 
+    background: rgba(255, 45, 45, 0.10);
+    animation: pulse 1.2s ease-in-out infinite alternate;
+}
+#battery.full { color: #8E8E93; }
+
+/* ─── SEPARATOR ───────────────────────────────────────── */
+
+#custom-separator {
+    color: transparent;
+    font-size: 0;
+    padding: 0;
+    margin: 9px 6px;
+    min-width: 1px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 1px;
+}
+
+/* ─── CLOCK ───────────────────────────────────────────── */
+
+#clock {
+    font-family: "Ndot 55", "Ndot", "JetBrains Mono", monospace;
+    font-weight: 400;
+    font-size: 14px;
+    color: #FFFFFF;
+    letter-spacing: 1px;
+    padding: 0 14px;
+}
+
+#clock:hover {
+    color: #FF2D2D;
+    background: transparent;
+}
+
+/* ─── CONTROL ─────────────────────────────────────────── */
+
+#custom-control {
+    color: #FF2D2D;
+    font-size: 10px;
+    padding: 0 12px 0 8px;
+}
+
+#custom-control:hover {
+    background: rgba(255, 45, 45, 0.10);
+    color: #FF6B6B;
+}
+
+/* ─── TOOLTIPS ────────────────────────────────────────── */
+
+tooltip {
+    background: rgba(11, 11, 12, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    padding: 10px 14px;
+}
+
+tooltip label {
+    color: #E0E0E3;
+    font-family: "Inter", -apple-system, sans-serif;
+    font-size: 12px;
+    font-weight: 400;
+}

@@ -1,0 +1,1846 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Calendar
+Unified with control/volume/network/etc design language:
+  - red glyph dot in header
+  - hero dot-matrix DAY number + meta
+  - CircleButton for + NEW and TODAY
+  - flat month grid with Nothing-style today highlight
+  - flat agenda list with event rows
+  - CRUD events via EventEditor (layer-shell window)
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import calendar
+import datetime
+import math
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_notify import notify_error, notify_info, notify_success
+except ImportError:
+
+    def notify_success(*a, **kw):
+        return None
+
+    def notify_error(*a, **kw):
+        return None
+
+    def notify_info(*a, **kw):
+        return None
+
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+WHITE_04 = (1.0, 1.0, 1.0, 0.04)
+
+EVENTS_FILE = Path.home() / ".local" / "share" / "nothing-calendar" / "events.txt"
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Events CRUD
+# ═════════════════════════════════════════════════════════════
+
+
+class EventsSource:
+    @staticmethod
+    def _ensure_file():
+        EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not EVENTS_FILE.exists():
+            EVENTS_FILE.write_text(
+                "# Nothing Calendar events\n"
+                "# Format: YYYY-MM-DD HH:MM Description  #id:<uuid>\n"
+                "# All-day: YYYY-MM-DD Description  #id:<uuid>\n"
+            )
+
+    @staticmethod
+    def load():
+        EventsSource._ensure_file()
+        events = []
+        try:
+            for line in EVENTS_FILE.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ev = EventsSource._parse_line(line)
+                if ev:
+                    events.append(ev)
+        except Exception as e:
+            print(f"[cal] load: {e}", file=sys.stderr)
+        return events
+
+    @staticmethod
+    def _parse_line(line):
+        ev_id = ""
+        m_id = re.search(r"#id:([a-zA-Z0-9\-]+)\s*$", line)
+        if m_id:
+            ev_id = m_id.group(1)
+            line = line[: m_id.start()].rstrip()
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(.+)$", line)
+        if m:
+            try:
+                dt = datetime.datetime.strptime(
+                    f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M"
+                )
+                return {
+                    "id": ev_id,
+                    "date": dt.date(),
+                    "time": dt.time(),
+                    "desc": m.group(3).strip(),
+                    "datetime": dt,
+                    "all_day": False,
+                }
+            except Exception:
+                pass
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+(.+)$", line)
+        if m:
+            try:
+                d = datetime.datetime.strptime(m.group(1), "%Y-%m-%d").date()
+                return {
+                    "id": ev_id,
+                    "date": d,
+                    "time": None,
+                    "desc": m.group(2).strip(),
+                    "datetime": datetime.datetime.combine(d, datetime.time(0, 0)),
+                    "all_day": True,
+                }
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _format_line(ev):
+        date_s = ev["date"].strftime("%Y-%m-%d")
+        if ev["all_day"]:
+            line = f"{date_s} {ev['desc']}"
+        else:
+            line = f"{date_s} {ev['time'].strftime('%H:%M')} {ev['desc']}"
+        if ev.get("id"):
+            line += f"  #id:{ev['id']}"
+        return line
+
+    @staticmethod
+    def add(date_obj, time_obj, desc):
+        EventsSource._ensure_file()
+        ev = {
+            "id": str(uuid.uuid4())[:8],
+            "date": date_obj,
+            "time": time_obj,
+            "desc": desc.strip(),
+            "all_day": time_obj is None,
+            "datetime": datetime.datetime.combine(
+                date_obj, time_obj or datetime.time(0, 0)
+            ),
+        }
+        try:
+            with open(EVENTS_FILE, "a") as f:
+                f.write(EventsSource._format_line(ev) + "\n")
+            return ev
+        except Exception as e:
+            print(f"[cal] add: {e}", file=sys.stderr)
+            return None
+
+    @staticmethod
+    def update(ev_id, date_obj, time_obj, desc):
+        if not ev_id:
+            return False
+        events = EventsSource.load()
+        for ev in events:
+            if ev["id"] == ev_id:
+                ev["date"] = date_obj
+                ev["time"] = time_obj
+                ev["desc"] = desc.strip()
+                ev["all_day"] = time_obj is None
+                ev["datetime"] = datetime.datetime.combine(
+                    date_obj, time_obj or datetime.time(0, 0)
+                )
+                return EventsSource._save_all(events)
+        return False
+
+    @staticmethod
+    def delete(ev_id):
+        if not ev_id:
+            return False
+        events = [e for e in EventsSource.load() if e["id"] != ev_id]
+        return EventsSource._save_all(events)
+
+    @staticmethod
+    def _save_all(events):
+        EventsSource._ensure_file()
+        try:
+            header_lines = []
+            for line in EVENTS_FILE.read_text().splitlines():
+                if line.strip().startswith("#") or not line.strip():
+                    header_lines.append(line)
+                else:
+                    break
+            content = "\n".join(header_lines).rstrip() + "\n\n"
+            for ev in sorted(events, key=lambda x: x["datetime"]):
+                content += EventsSource._format_line(ev) + "\n"
+            tmp = EVENTS_FILE.with_suffix(".tmp")
+            tmp.write_text(content)
+            tmp.replace(EVENTS_FILE)
+            return True
+        except Exception as e:
+            print(f"[cal] save: {e}", file=sys.stderr)
+            return False
+
+    @staticmethod
+    def for_date(events, d):
+        return sorted(
+            [e for e in events if e["date"] == d], key=lambda x: x["datetime"]
+        )
+
+    @staticmethod
+    def upcoming(events, days=14):
+        today = datetime.date.today()
+        cutoff = today + datetime.timedelta(days=days)
+        return sorted(
+            [e for e in events if today <= e["date"] <= cutoff],
+            key=lambda x: x["datetime"],
+        )
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_plus(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.2)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.30
+    cr.move_to(cx - s, cy)
+    cr.line_to(cx + s, cy)
+    cr.move_to(cx, cy - s)
+    cr.line_to(cx, cy + s)
+    cr.stroke()
+
+
+def _draw_today(cr, cx, cy, active=False, size=22, color=None):
+    """Calendar / today icon — frame with header line and dot."""
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.34
+    round_rect(cr, cx - s, cy - s * 0.85, s * 2, s * 1.70, 2)
+    cr.stroke()
+    # Header bar
+    cr.set_line_width(2.4)
+    cr.move_to(cx - s, cy - s * 0.30)
+    cr.line_to(cx + s, cy - s * 0.30)
+    cr.stroke()
+    # Today dot
+    cr.arc(cx, cy + s * 0.32, s * 0.22, 0, 2 * math.pi)
+    cr.fill()
+
+
+def _draw_chevron_left(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.2)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.28
+    cr.move_to(cx + s * 0.55, cy - s)
+    cr.line_to(cx - s * 0.55, cy)
+    cr.line_to(cx + s * 0.55, cy + s)
+    cr.stroke()
+
+
+def _draw_chevron_right(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.2)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.28
+    cr.move_to(cx - s * 0.55, cy - s)
+    cr.line_to(cx + s * 0.55, cy)
+    cr.line_to(cx - s * 0.55, cy + s)
+    cr.stroke()
+
+
+def _draw_trash(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.30
+    cr.move_to(cx - s * 1.05, cy - s * 0.55)
+    cr.line_to(cx + s * 1.05, cy - s * 0.55)
+    cr.stroke()
+    cr.move_to(cx - s * 0.40, cy - s * 0.55)
+    cr.line_to(cx - s * 0.40, cy - s * 0.90)
+    cr.line_to(cx + s * 0.40, cy - s * 0.90)
+    cr.line_to(cx + s * 0.40, cy - s * 0.55)
+    cr.stroke()
+    cr.move_to(cx - s * 0.85, cy - s * 0.55)
+    cr.line_to(cx - s * 0.70, cy + s * 1.05)
+    cr.line_to(cx + s * 0.70, cy + s * 1.05)
+    cr.line_to(cx + s * 0.85, cy - s * 0.55)
+    cr.stroke()
+
+
+def _draw_check(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.4)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.30
+    cr.move_to(cx - s, cy)
+    cr.line_to(cx - s * 0.25, cy + s * 0.65)
+    cr.line_to(cx + s, cy - s * 0.55)
+    cr.stroke()
+
+
+def _draw_close(cr, cx, cy, active=False, size=14, color=None):
+    col = _resolve_color(color, WHITE_50)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(1.8)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.35
+    cr.move_to(cx - s, cy - s)
+    cr.line_to(cx + s, cy + s)
+    cr.move_to(cx + s, cy - s)
+    cr.line_to(cx - s, cy + s)
+    cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton (shared)
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a, emit=False):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+            if emit:
+                self.emit("toggled", self._active)
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Big day matrix — NDot
+# ═════════════════════════════════════════════════════════════
+
+DOT_FONT = {
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
+
+
+class BigDayMatrix(Gtk.DrawingArea):
+    def __init__(self, height=98):
+        super().__init__()
+        self.text = "00"
+        self.is_today = False
+        self.set_content_width(160)
+        self.set_content_height(height)
+        self.set_draw_func(self._draw)
+
+    def set_text(self, t, is_today=False):
+        if t != self.text or is_today != self.is_today:
+            self.text = t
+            self.is_today = is_today
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        chars = list(self.text)
+        rows = 7
+        cell = min(h / (rows + 1.4), 12)
+        char_w = 5 * cell
+        gap = cell * 0.7
+        total_w = len(chars) * char_w + (len(chars) - 1) * gap
+        start_x = (w - total_w) / 2
+        start_y = (h - rows * cell) / 2
+        dot_r = cell * 0.42
+        dot_r_off = cell * 0.16
+
+        on_color = (*RED, 1.0) if self.is_today else (1, 1, 1, 1)
+
+        for ci, ch in enumerate(chars):
+            glyph = DOT_FONT.get(ch, DOT_FONT[" "])
+            gx = start_x + ci * (char_w + gap)
+            for r in range(rows):
+                for c in range(5):
+                    x = gx + c * cell + cell / 2
+                    y = start_y + r * cell + cell / 2
+                    on = glyph[r][c] == "1"
+                    if on:
+                        cr.set_source_rgba(*on_color)
+                        cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                    else:
+                        cr.set_source_rgba(*WHITE_06)
+                        cr.arc(x, y, dot_r_off, 0, 2 * math.pi)
+                    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Month grid
+# ═════════════════════════════════════════════════════════════
+
+
+class MonthGrid(Gtk.DrawingArea):
+    __gsignals__ = {
+        "day-clicked": (GObject.SignalFlags.RUN_LAST, None, (int, int, int)),
+        "day-long-clicked": (GObject.SignalFlags.RUN_LAST, None, (int, int, int)),
+    }
+
+    def __init__(self):
+        super().__init__()
+        today = datetime.date.today()
+        self.year = today.year
+        self.month = today.month
+        self.selected = today
+        self.events_dates = set()
+        self._hover_cell = None  # (col, row)
+        self.set_content_height(240)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._on_click)
+        self.add_controller(click)
+
+        long_press = Gtk.GestureLongPress()
+        long_press.connect("pressed", self._on_long_press)
+        self.add_controller(long_press)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        motion.connect("leave", self._on_leave)
+        self.add_controller(motion)
+
+    def set_month(self, y, m):
+        self.year = y
+        self.month = m
+        self.queue_draw()
+
+    def set_selected(self, d):
+        self.selected = d
+        self.queue_draw()
+
+    def set_events_dates(self, dates):
+        self.events_dates = set(dates)
+        self.queue_draw()
+
+    def _xy_to_cell(self, x, y):
+        w = self.get_width()
+        h = self.get_height()
+        if w <= 0 or h <= 0:
+            return None
+        cell_w = w / 7
+        weekday_h = 28
+        cell_h = (h - weekday_h) / 6
+        col = int(x / cell_w)
+        row = int((y - weekday_h) / cell_h)
+        if col < 0 or col >= 7 or row < 0 or row >= 6:
+            return None
+        return (col, row)
+
+    def _day_from_cell(self, col, row):
+        first_weekday = datetime.date(self.year, self.month, 1).weekday()
+        day_index = row * 7 + col - first_weekday + 1
+        days_in_month = calendar.monthrange(self.year, self.month)[1]
+        if 1 <= day_index <= days_in_month:
+            return day_index
+        return None
+
+    def _on_motion(self, c, x, y):
+        cell = self._xy_to_cell(x, y)
+        if cell != self._hover_cell:
+            self._hover_cell = cell
+            self.queue_draw()
+
+    def _on_leave(self, *a):
+        if self._hover_cell is not None:
+            self._hover_cell = None
+            self.queue_draw()
+
+    def _on_click(self, g, n, x, y):
+        cell = self._xy_to_cell(x, y)
+        if cell is None:
+            return
+        day = self._day_from_cell(*cell)
+        if day is not None:
+            self.emit("day-clicked", self.year, self.month, day)
+
+    def _on_long_press(self, g, x, y):
+        cell = self._xy_to_cell(x, y)
+        if cell is None:
+            return
+        day = self._day_from_cell(*cell)
+        if day is not None:
+            self.emit("day-long-clicked", self.year, self.month, day)
+
+    def _draw(self, area, cr, w, h):
+        cell_w = w / 7
+        weekday_h = 28
+        cell_h = (h - weekday_h) / 6
+
+        # Weekday labels
+        cr.select_font_face("Inter", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(9)
+        for i, wd in enumerate(["MO", "TU", "WE", "TH", "FR", "SA", "SU"]):
+            ext = cr.text_extents(wd)
+            tx = i * cell_w + (cell_w - ext.width) / 2
+            if i >= 5:
+                cr.set_source_rgba(*WHITE_25)
+            else:
+                cr.set_source_rgba(*WHITE_50)
+            cr.move_to(tx, 16)
+            cr.show_text(wd)
+
+        # Tiny separator under weekdays
+        cr.set_source_rgba(*WHITE_06)
+        cr.rectangle(0, weekday_h - 1, w, 1)
+        cr.fill()
+
+        first_weekday = datetime.date(self.year, self.month, 1).weekday()
+        days_in_month = calendar.monthrange(self.year, self.month)[1]
+        today = datetime.date.today()
+
+        cr.select_font_face(
+            "JetBrains Mono", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL
+        )
+        cr.set_font_size(13)
+
+        for day in range(1, days_in_month + 1):
+            pos = first_weekday + day - 1
+            col = pos % 7
+            row = pos // 7
+            x = col * cell_w
+            y = weekday_h + row * cell_h
+            d = datetime.date(self.year, self.month, day)
+            is_today = d == today
+            is_selected = d == self.selected
+            is_hovered = (col, row) == self._hover_cell
+            has_event = d in self.events_dates
+            is_weekend = col >= 5
+
+            # Cell background
+            inset = 4
+            cx = x + inset
+            cy = y + inset
+            cw = cell_w - inset * 2
+            ch = cell_h - inset * 2
+            radius = min(cw, ch) / 2  # circle for small cells
+
+            if is_today:
+                # Red filled circle
+                cr.set_source_rgb(*RED)
+                cr.arc(x + cell_w / 2, y + cell_h / 2, min(cw, ch) / 2, 0, 2 * math.pi)
+                cr.fill()
+            elif is_selected:
+                # White outline circle
+                cr.set_source_rgba(1, 1, 1, 0.85)
+                cr.set_line_width(1.4)
+                cr.arc(
+                    x + cell_w / 2,
+                    y + cell_h / 2,
+                    min(cw, ch) / 2 - 0.7,
+                    0,
+                    2 * math.pi,
+                )
+                cr.stroke()
+            elif is_hovered:
+                cr.set_source_rgba(*WHITE_08)
+                cr.arc(x + cell_w / 2, y + cell_h / 2, min(cw, ch) / 2, 0, 2 * math.pi)
+                cr.fill()
+
+            # Day number
+            text = str(day)
+            ext = cr.text_extents(text)
+            tx = x + (cell_w - ext.width) / 2 - ext.x_bearing
+            ty = y + cell_h / 2 + ext.height / 2 - 2
+
+            if is_today:
+                cr.set_source_rgb(1, 1, 1)
+            elif is_selected:
+                cr.set_source_rgb(1, 1, 1)
+            elif is_weekend:
+                cr.set_source_rgba(*WHITE_50)
+            else:
+                cr.set_source_rgba(*WHITE_85)
+            cr.move_to(tx, ty)
+            cr.show_text(text)
+
+            # Event indicator dot — at bottom of cell
+            if has_event:
+                if is_today:
+                    cr.set_source_rgb(1, 1, 1)
+                else:
+                    cr.set_source_rgb(*RED)
+                cr.arc(x + cell_w / 2, y + cell_h - 6, 1.8, 0, 2 * math.pi)
+                cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Event row — flat, clickable
+# ═════════════════════════════════════════════════════════════
+
+
+class EventRow(Gtk.Button):
+    def __init__(self, event, on_click):
+        super().__init__()
+        self.event = event
+        self.on_click = on_click
+        self.add_css_class("list-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+
+        # Time block (left)
+        time_block = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        time_block.set_valign(Gtk.Align.CENTER)
+        time_block.set_size_request(54, -1)
+
+        t = event["datetime"].strftime("%H:%M") if event["time"] else "ALL"
+        time_lbl = Gtk.Label(label=t, xalign=0)
+        time_lbl.add_css_class("event-time")
+        time_block.append(time_lbl)
+
+        date_lbl = Gtk.Label(label=event["date"].strftime("%d %b").upper(), xalign=0)
+        date_lbl.add_css_class("event-date")
+        time_block.append(date_lbl)
+        box.append(time_block)
+
+        # Vertical accent bar
+        bar = Gtk.DrawingArea()
+        bar.set_content_width(2)
+        bar.set_content_height(36)
+        bar.set_valign(Gtk.Align.CENTER)
+        is_today = event["date"] == datetime.date.today()
+
+        def _draw_bar(a, cr, w, h, _today=is_today):
+            if _today:
+                cr.set_source_rgb(*RED)
+            else:
+                cr.set_source_rgba(*WHITE_25)
+            round_rect(cr, 0, 0, w, h, w / 2)
+            cr.fill()
+
+        bar.set_draw_func(_draw_bar)
+        box.append(bar)
+
+        # Info column
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        desc_lbl = Gtk.Label(label=event["desc"], xalign=0)
+        desc_lbl.add_css_class("row-name")
+        desc_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        info.append(desc_lbl)
+
+        days_diff = (event["date"] - datetime.date.today()).days
+        if days_diff == 0:
+            tag = "TODAY"
+        elif days_diff == 1:
+            tag = "TOMORROW"
+        elif 1 < days_diff < 7:
+            tag = f"IN {days_diff} DAYS"
+        elif days_diff < 0:
+            tag = "PAST"
+        else:
+            tag = event["date"].strftime("%a · %d %b").upper()
+
+        tag_lbl = Gtk.Label(label=tag, xalign=0)
+        tag_lbl.add_css_class("row-status")
+        info.append(tag_lbl)
+        box.append(info)
+
+        # Edit action label
+        edit_lbl = Gtk.Label(label="EDIT", xalign=1)
+        edit_lbl.add_css_class("row-action")
+        edit_lbl.set_valign(Gtk.Align.CENTER)
+        box.append(edit_lbl)
+
+        self.set_child(box)
+        self.connect("clicked", lambda *a: self.on_click(self.event))
+
+
+# ═════════════════════════════════════════════════════════════
+#  Event Editor (layer-shell window)
+# ═════════════════════════════════════════════════════════════
+
+
+class EventEditor(Adw.ApplicationWindow):
+    __gsignals__ = {
+        "saved": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "deleted": (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, app, event=None, default_date=None):
+        super().__init__(application=app)
+        self.set_resizable(False)
+        self.set_default_size(400, 580)
+        self.set_title("Event")
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-calendar-edit")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        self.event = event
+        self.is_new = event is None
+
+        if event:
+            self.date_obj = event["date"]
+            self.time_obj = event["time"]
+            self.desc = event["desc"]
+            self.all_day = event["all_day"]
+            self.ev_id = event["id"]
+        else:
+            self.date_obj = default_date or datetime.date.today()
+            self.time_obj = datetime.time(12, 0)
+            self.desc = ""
+            self.all_day = False
+            self.ev_id = None
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("main-card")
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(18)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title_lbl = Gtk.Label(
+            label="NEW EVENT" if self.is_new else "EDIT EVENT", xalign=0
+        )
+        title_lbl.add_css_class("window-title")
+        title_lbl.set_hexpand(True)
+        header.append(title_lbl)
+        outer.append(header)
+
+        # ─── DESCRIPTION ───
+        outer.append(self._mk_section_hdr("DESCRIPTION"))
+
+        desc_wrap = Gtk.Box()
+        desc_wrap.set_margin_start(20)
+        desc_wrap.set_margin_end(20)
+        desc_wrap.set_margin_bottom(12)
+        self.desc_entry = Gtk.Entry()
+        self.desc_entry.add_css_class("text-entry-clean")
+        self.desc_entry.set_placeholder_text("What is happening?")
+        self.desc_entry.set_text(self.desc)
+        self.desc_entry.set_hexpand(True)
+        self.desc_entry.connect("activate", lambda *a: self._save())
+        desc_wrap.append(self.desc_entry)
+        outer.append(desc_wrap)
+
+        # ─── DATE ───
+        outer.append(self._mk_section_hdr("DATE"))
+
+        date_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        date_row.set_margin_start(20)
+        date_row.set_margin_end(20)
+        date_row.set_margin_bottom(8)
+        date_row.set_homogeneous(True)
+
+        self.year_spin = self._mk_spin(self.date_obj.year, 1970, 2100, 1)
+        date_row.append(self._spin_wrap("YYYY", self.year_spin))
+
+        self.month_spin = self._mk_spin(self.date_obj.month, 1, 12, 1)
+        date_row.append(self._spin_wrap("MM", self.month_spin))
+
+        self.day_spin = self._mk_spin(self.date_obj.day, 1, 31, 1)
+        date_row.append(self._spin_wrap("DD", self.day_spin))
+
+        outer.append(date_row)
+
+        # Quick chips
+        chip_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        chip_row.set_margin_bottom(16)
+        chip_row.set_margin_start(20)
+        chip_row.set_margin_end(20)
+        chip_row.set_homogeneous(True)
+        for label, days in [("TODAY", 0), ("TOMORROW", 1), ("+1 WEEK", 7)]:
+            btn = Gtk.Button(label=label)
+            btn.add_css_class("chip-btn-clean")
+            btn.connect("clicked", lambda b, d=days: self._set_relative_date(d))
+            chip_row.append(btn)
+        outer.append(chip_row)
+
+        # ─── TIME ───
+        outer.append(self._mk_section_hdr("TIME"))
+
+        # All-day toggle as CircleButton + label
+        ad_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        ad_row.set_margin_start(28)
+        ad_row.set_margin_end(20)
+        ad_row.set_margin_bottom(10)
+        ad_lbl = Gtk.Label(label="All day", xalign=0)
+        ad_lbl.add_css_class("adapter-label-clean")
+        ad_lbl.set_hexpand(True)
+        ad_row.append(ad_lbl)
+
+        self.all_day_circle = CircleButton(
+            _draw_check, size=40, toggle=True, active=self.all_day
+        )
+        self.all_day_circle.connect("toggled", self._on_all_day)
+        ad_row.append(self.all_day_circle)
+        outer.append(ad_row)
+
+        # Hour:Minute spinners
+        self.time_row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.time_row_box.set_margin_start(20)
+        self.time_row_box.set_margin_end(20)
+        self.time_row_box.set_margin_bottom(16)
+        self.time_row_box.set_homogeneous(True)
+
+        self.hour_spin = self._mk_spin(
+            self.time_obj.hour if self.time_obj else 12, 0, 23, 1
+        )
+        self.time_row_box.append(self._spin_wrap("HH", self.hour_spin))
+
+        self.minute_spin = self._mk_spin(
+            self.time_obj.minute if self.time_obj else 0, 0, 59, 5
+        )
+        self.time_row_box.append(self._spin_wrap("MM", self.minute_spin))
+
+        spacer = Gtk.Box()
+        self.time_row_box.append(spacer)
+
+        self.time_row_box.set_visible(not self.all_day)
+        outer.append(self.time_row_box)
+
+        # ─── Buttons ───
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btns.set_margin_top(12)
+        btns.set_margin_start(20)
+        btns.set_margin_end(20)
+        btns.set_margin_bottom(22)
+
+        if not self.is_new:
+            del_btn = Gtk.Button(label="DELETE")
+            del_btn.add_css_class("btn-pill-danger")
+            del_btn.connect("clicked", lambda *a: self._delete())
+            btns.append(del_btn)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        btns.append(spacer)
+
+        cancel = Gtk.Button(label="CANCEL")
+        cancel.add_css_class("btn-pill-ghost")
+        cancel.connect("clicked", lambda *a: self.close())
+        btns.append(cancel)
+
+        save = Gtk.Button(label="SAVE")
+        save.add_css_class("btn-pill-accent")
+        save.connect("clicked", lambda *a: self._save())
+        btns.append(save)
+        outer.append(btns)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_child(outer)
+        self.set_content(scroll)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+        self.desc_entry.grab_focus()
+
+    def _mk_section_hdr(self, text):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_bottom(8)
+        lbl = Gtk.Label(label=text, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _mk_spin(self, value, lo, hi, step):
+        s = Gtk.SpinButton()
+        s.set_adjustment(Gtk.Adjustment.new(value, lo, hi, step, step * 5, 0))
+        s.add_css_class("num-spin-clean")
+        s.set_numeric(True)
+        s.set_width_chars(4)
+        return s
+
+    def _spin_wrap(self, label, spin):
+        b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.add_css_class("spin-label")
+        b.append(lbl)
+        b.append(spin)
+        return b
+
+    def _set_relative_date(self, days):
+        d = datetime.date.today() + datetime.timedelta(days=days)
+        self.year_spin.set_value(d.year)
+        self.month_spin.set_value(d.month)
+        self.day_spin.set_value(d.day)
+
+    def _on_all_day(self, _t, active):
+        self.all_day = active
+        self.time_row_box.set_visible(not active)
+
+    def _save(self):
+        desc = self.desc_entry.get_text().strip()
+        if not desc:
+            return
+        try:
+            date_obj = datetime.date(
+                int(self.year_spin.get_value()),
+                int(self.month_spin.get_value()),
+                int(self.day_spin.get_value()),
+            )
+        except Exception:
+            return
+        time_obj = None
+        if not self.all_day:
+            try:
+                time_obj = datetime.time(
+                    int(self.hour_spin.get_value()), int(self.minute_spin.get_value())
+                )
+            except Exception:
+                return
+
+        def worker():
+            if self.is_new:
+                ev = EventsSource.add(date_obj, time_obj, desc)
+                if ev:
+                    notify_success("Event created", desc, app="nothing-calendar")
+                    GLib.idle_add(self._after_save)
+            else:
+                ok = EventsSource.update(self.ev_id, date_obj, time_obj, desc)
+                if ok:
+                    notify_success("Event updated", desc, app="nothing-calendar")
+                    GLib.idle_add(self._after_save)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_save(self):
+        self.emit("saved")
+        self.close()
+        return False
+
+    def _delete(self):
+        if not self.ev_id:
+            return
+
+        def worker():
+            ok = EventsSource.delete(self.ev_id)
+            if ok:
+                notify_info("Event deleted", self.desc, app="nothing-calendar")
+                GLib.idle_add(self._after_delete)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_delete(self):
+        self.emit("deleted")
+        self.close()
+        return False
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingCalendarWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._refresh_pending = False
+        self._events = []
+
+        today = datetime.date.today()
+        self._view_year = today.year
+        self._view_month = today.month
+        self._selected = today
+
+        self.set_title("nothing-calendar")
+        self.set_default_size(400, 760)
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-calendar")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 12)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, 12)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="CALENDAR", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+
+        # Today circle button
+        self.today_circle = CircleButton(_draw_today, size=34, toggle=False)
+        self.today_circle.connect("clicked", lambda _c: self._on_today())
+        header.append(self.today_circle)
+
+        # + NEW circle button (accent)
+        self.new_circle = CircleButton(
+            _draw_plus, size=34, toggle=False, accent_only=True
+        )
+        self.new_circle.connect("clicked", lambda _c: self._on_new_event())
+        header.append(self.new_circle)
+        card.append(header)
+
+        # ─── Hero — big day number ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(14)
+        hero.set_margin_bottom(8)
+        self.hero_day = BigDayMatrix(height=92)
+        self.hero_day.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero_day)
+        self.hero_meta = Gtk.Label(label="")
+        self.hero_meta.add_css_class("hero-date")
+        hero.append(self.hero_meta)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(16)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── Month nav row ───
+        nav_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_row.set_margin_start(24)
+        nav_row.set_margin_end(24)
+        nav_row.set_margin_top(18)
+        nav_row.set_margin_bottom(8)
+
+        prev_btn = CircleButton(_draw_chevron_left, size=32, toggle=False)
+        prev_btn.connect("clicked", lambda _c: self._shift_month(-1))
+        nav_row.append(prev_btn)
+
+        self.month_lbl = Gtk.Label(label="", xalign=0.5)
+        self.month_lbl.add_css_class("month-title")
+        self.month_lbl.set_hexpand(True)
+        nav_row.append(self.month_lbl)
+
+        next_btn = CircleButton(_draw_chevron_right, size=32, toggle=False)
+        next_btn.connect("clicked", lambda _c: self._shift_month(1))
+        nav_row.append(next_btn)
+        card.append(nav_row)
+
+        # ─── Month grid ───
+        grid_wrap = Gtk.Box()
+        grid_wrap.set_margin_start(20)
+        grid_wrap.set_margin_end(20)
+        grid_wrap.set_margin_top(4)
+        grid_wrap.set_margin_bottom(4)
+        self.grid = MonthGrid()
+        self.grid.connect("day-clicked", self._on_day_clicked)
+        self.grid.connect("day-long-clicked", self._on_day_long_clicked)
+        self.grid.set_hexpand(True)
+        grid_wrap.append(self.grid)
+        card.append(grid_wrap)
+
+        hint_lbl = Gtk.Label(label="CLICK DAY · LONG-PRESS TO ADD EVENT", xalign=0.5)
+        hint_lbl.add_css_class("hint-label-clean")
+        hint_lbl.set_margin_top(2)
+        hint_lbl.set_margin_bottom(4)
+        card.append(hint_lbl)
+
+        # ─── Agenda section ───
+        ag_hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        ag_hdr_row.set_margin_start(28)
+        ag_hdr_row.set_margin_end(28)
+        ag_hdr_row.set_margin_top(20)
+        ag_hdr_row.set_margin_bottom(8)
+        self.ag_lbl = Gtk.Label(label="AGENDA", xalign=0)
+        self.ag_lbl.add_css_class("section-header-clean")
+        self.ag_lbl.set_hexpand(True)
+        ag_hdr_row.append(self.ag_lbl)
+        self.ag_counter = Gtk.Label(label="")
+        self.ag_counter.add_css_class("section-counter-mono")
+        ag_hdr_row.append(self.ag_counter)
+        card.append(ag_hdr_row)
+
+        self.events_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.events_box.set_margin_start(20)
+        self.events_box.set_margin_end(20)
+        card.append(self.events_box)
+
+        self.empty_lbl = Gtk.Label(label="NO EVENTS")
+        self.empty_lbl.add_css_class("empty-label-clean")
+        self.empty_lbl.set_margin_top(28)
+        self.empty_lbl.set_margin_bottom(28)
+        card.append(self.empty_lbl)
+
+        bottom = Gtk.Box()
+        bottom.set_size_request(-1, 28)
+        card.append(bottom)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+        self._kick_refresh()
+        GLib.timeout_add(30000, self._auto_refresh)
+        self._update_view()
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _shift_month(self, delta):
+        m = self._view_month + delta
+        y = self._view_year
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        self._view_year = y
+        self._view_month = m
+        self._update_view()
+
+    def _on_today(self, *a):
+        today = datetime.date.today()
+        self._view_year = today.year
+        self._view_month = today.month
+        self._selected = today
+        self._update_view()
+
+    def _on_day_clicked(self, _g, y, m, d):
+        try:
+            self._selected = datetime.date(y, m, d)
+            self._update_view()
+        except Exception:
+            pass
+
+    def _on_day_long_clicked(self, _g, y, m, d):
+        try:
+            target = datetime.date(y, m, d)
+        except Exception:
+            return
+        self._open_editor(default_date=target)
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def worker():
+            try:
+                events = EventsSource.load()
+            except Exception as e:
+                print(f"[cal] events: {e}", file=sys.stderr)
+                events = []
+            GLib.idle_add(self._apply, events)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, events):
+        self._refresh_pending = False
+        self._events = events
+        self._update_view()
+        return False
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    def _update_view(self):
+        today = datetime.date.today()
+        is_today_sel = self._selected == today
+
+        self.hero_day.set_text(f"{self._selected.day:02d}", is_today=is_today_sel)
+        self.hero_meta.set_text(self._selected.strftime("%A · %B %Y").upper())
+        self.month_lbl.set_text(
+            datetime.date(self._view_year, self._view_month, 1)
+            .strftime("%B %Y")
+            .upper()
+        )
+
+        self.grid.set_month(self._view_year, self._view_month)
+        self.grid.set_selected(self._selected)
+        self.grid.set_events_dates([e["date"] for e in self._events])
+
+        day_events = EventsSource.for_date(self._events, self._selected)
+        if is_today_sel and day_events:
+            self.ag_lbl.set_text("TODAY")
+        elif day_events:
+            self.ag_lbl.set_text("SELECTED DAY")
+        else:
+            self.ag_lbl.set_text("UPCOMING")
+
+        display = (
+            day_events if day_events else EventsSource.upcoming(self._events, days=30)
+        )
+
+        self.ag_counter.set_text(str(len(display)) if display else "")
+
+        while child := self.events_box.get_first_child():
+            self.events_box.remove(child)
+        if not display:
+            self.empty_lbl.set_visible(True)
+        else:
+            self.empty_lbl.set_visible(False)
+            for i, e in enumerate(display):
+                row = EventRow(e, self._on_event_clicked)
+                self.events_box.append(row)
+                if i < len(display) - 1:
+                    div_inline = Gtk.Box()
+                    div_inline.add_css_class("row-divider-inline")
+                    div_inline.set_margin_start(20)
+                    div_inline.set_margin_end(8)
+                    div_inline.set_size_request(-1, 1)
+                    self.events_box.append(div_inline)
+
+    def _on_event_clicked(self, event):
+        if not event.get("id"):
+            event["id"] = str(uuid.uuid4())[:8]
+            EventsSource._save_all(self._events)
+        self._open_editor(event=event)
+
+    def _on_new_event(self, *a):
+        self._open_editor(default_date=self._selected)
+
+    def _open_editor(self, event=None, default_date=None):
+        editor = EventEditor(self.app, event=event, default_date=default_date)
+        editor.connect("saved", lambda *a: self._kick_refresh())
+        editor.connect("deleted", lambda *a: self._kick_refresh())
+        editor.present()
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        if keyval == Gdk.KEY_Left:
+            self._shift_month(-1)
+            return True
+        if keyval == Gdk.KEY_Right:
+            self._shift_month(1)
+            return True
+        if keyval == Gdk.KEY_Home:
+            self._on_today()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-calendar")
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingCalendarApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .section-counter-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 1px;
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+    .adapter-label-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .month-title {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .hint-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 8px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+
+    /* Event row (agenda) — flat */
+    .list-row {
+        background: transparent;
+        background-color: transparent;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 12px;
+        min-height: 0;
+        box-shadow: none;
+        transition: background-color 120ms ease;
+    }
+    .list-row:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+
+    .row-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .row-status {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.50);
+        letter-spacing: 1.5px;
+    }
+    .row-action {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1.5px;
+    }
+    .list-row:hover .row-action {
+        color: #FF2D2D;
+    }
+
+    /* Event time block */
+    .event-time {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 14px;
+        color: #FFFFFF;
+        letter-spacing: 1px;
+    }
+    .event-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: #FF2D2D;
+        letter-spacing: 1px;
+    }
+
+    /* Editor text entry */
+    .text-entry-clean {
+        background: rgba(255, 255, 255, 0.04);
+        color: #FFFFFF;
+        font-family: "Inter", sans-serif;
+        font-size: 14px;
+        font-weight: 500;
+        padding: 12px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        letter-spacing: 0.1px;
+        caret-color: #FF2D2D;
+    }
+    .text-entry-clean:focus {
+        border-color: rgba(255, 45, 45, 0.50);
+        background: rgba(255, 255, 255, 0.06);
+    }
+
+    /* Spin buttons (date/time) */
+    .num-spin-clean {
+        background: rgba(255, 255, 255, 0.04);
+        color: #FFFFFF;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 14px;
+        font-weight: 700;
+        padding: 8px 6px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        letter-spacing: 1px;
+        min-height: 0;
+    }
+    .num-spin-clean:focus {
+        border-color: rgba(255, 45, 45, 0.50);
+    }
+    .num-spin-clean button {
+        background: transparent;
+        color: rgba(255, 255, 255, 0.50);
+        border: none;
+        padding: 2px 6px;
+        min-height: 0;
+    }
+    .num-spin-clean button:hover {
+        color: #FF2D2D;
+        background: rgba(255, 45, 45, 0.08);
+    }
+    .spin-label {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 8px;
+        color: rgba(255, 255, 255, 0.35);
+        letter-spacing: 2px;
+        margin-left: 2px;
+    }
+
+    /* Quick chip buttons */
+    .chip-btn-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        letter-spacing: 1.5px;
+        padding: 8px 0;
+        border-radius: 14px;
+        background-color: rgba(255, 255, 255, 0.05);
+        color: rgba(255, 255, 255, 0.70);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .chip-btn-clean:hover {
+        background-color: rgba(255, 45, 45, 0.10);
+        color: #FF2D2D;
+        border-color: rgba(255, 45, 45, 0.30);
+    }
+
+    /* Editor action buttons */
+    .btn-pill-ghost, .btn-pill-accent, .btn-pill-danger {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 10px;
+        letter-spacing: 2px;
+        padding: 10px 18px;
+        border-radius: 18px;
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .btn-pill-ghost {
+        background-color: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .btn-pill-ghost:hover {
+        background-color: rgba(255, 255, 255, 0.10);
+        color: #FFFFFF;
+    }
+    .btn-pill-accent {
+        background-color: #FF2D2D;
+        color: #FFFFFF;
+        border: 1px solid #FF2D2D;
+    }
+    .btn-pill-accent:hover {
+        background-color: #FF4747;
+        border-color: #FF4747;
+    }
+    .btn-pill-danger {
+        background-color: transparent;
+        color: #FF2D2D;
+        border: 1px solid rgba(255, 45, 45, 0.40);
+    }
+    .btn-pill-danger:hover {
+        background-color: rgba(255, 45, 45, 0.15);
+        color: #FFFFFF;
+        border-color: #FF2D2D;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.calendar",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("new", "n", "Open new event dialog"),
+            ("daemon", "d", "Run as daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingCalendarWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if "quit" in opts:
+            self.quit()
+            return 0
+        if "new" in opts:
+            self.window.show_popup()
+            GLib.timeout_add(100, lambda: (self.window._on_new_event(), False)[1])
+            return 0
+        if "hide" in opts:
+            self.window.hide_popup()
+        elif "toggle" in opts:
+            self.window.toggle_popup()
+        elif "show" in opts:
+            self.window.show_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    app = NothingCalendarApp()
+    sys.exit(app.run(sys.argv))

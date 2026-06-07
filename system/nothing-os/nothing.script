@@ -1,0 +1,58 @@
+// Nothing OS — Plymouth Glyph Animation
+
+Window.SetBackgroundTopColor(0.055, 0.055, 0.055);
+Window.SetBackgroundBottomColor(0.055, 0.055, 0.055);
+
+screen_width = Window.GetWidth();
+screen_height = Window.GetHeight();
+cx = screen_width / 2;
+cy = screen_height / 2;
+
+// Load dot sprite
+dot = ImageNew("dot.png");
+dot_sprite = SpriteNew();
+dot_sprite.SetImage(dot);
+dot_sprite.SetX(cx - dot.GetWidth() / 2);
+dot_sprite.SetY(cy - dot.GetHeight() / 2);
+dot_sprite.SetOpacity(0);
+
+// Pulse animation
+counter = 0;
+fun refresh_callback() {
+    counter++;
+    // 60 fps approx
+    // Pulse: 0 → 1 → 0 over 60 frames
+    progress = (counter % 60) / 60;
+    opacity = Math.Sin(progress * 3.14159) * 1.0;
+    dot_sprite.SetOpacity(opacity);
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+
+// Loading text (под точкой)
+loading_text = "loading";
+font = "NDot 55 12";
+
+text_image = Image.Text(loading_text, 0.6, 0.6, 0.6, 1, font);
+text_sprite = SpriteNew();
+text_sprite.SetImage(text_image);
+text_sprite.SetX(cx - text_image.GetWidth() / 2);
+text_sprite.SetY(cy + 80);
+
+// Password prompt
+fun display_password_callback(prompt, bullets) {
+    prompt_image = Image.Text(prompt, 0.9, 0.9, 0.9, 1, "NType 82 Mono 11");
+    prompt_sprite = SpriteNew();
+    prompt_sprite.SetImage(prompt_image);
+    prompt_sprite.SetX(cx - prompt_image.GetWidth() / 2);
+    prompt_sprite.SetY(cy + 120);
+}
+
+Plymouth.SetDisplayPasswordFunction(display_password_callback);
+
+// Boot progress
+fun boot_progress_callback(time, progress) {
+    // не показываем bar, точка сама всё говорит
+}
+
+Plymouth.SetBootProgressFunction(boot_progress_callback);

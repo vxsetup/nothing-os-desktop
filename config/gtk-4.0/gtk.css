@@ -1,0 +1,596 @@
+/* ═══════════════════════════════════════════════════════════
+   Nothing OS — GTK 4 (modern apps)
+   ═══════════════════════════════════════════════════════════ */
+
+@define-color accent_color           #FF2D2D;
+@define-color accent_bg_color        #FF2D2D;
+@define-color accent_fg_color        #FFFFFF;
+@define-color destructive_color      #FF6B6B;
+@define-color destructive_bg_color   #FF2D2D;
+@define-color success_color          #30D158;
+@define-color warning_color          #FFD60A;
+@define-color error_color            #FF2D2D;
+
+@define-color window_bg_color        #0F0F11;
+@define-color window_fg_color        #F7F7F7;
+@define-color view_bg_color          #141416;
+@define-color view_fg_color          #F7F7F7;
+@define-color headerbar_bg_color     #141416;
+@define-color headerbar_fg_color     #F7F7F7;
+@define-color sidebar_bg_color       #141416;
+@define-color sidebar_fg_color       #C8C8CC;
+@define-color popover_bg_color       #1A1A1D;
+@define-color popover_fg_color       #F7F7F7;
+@define-color card_bg_color          rgba(255, 255, 255, 0.04);
+@define-color card_fg_color          #F7F7F7;
+@define-color card_shade_color       rgba(0, 0, 0, 0.36);
+
+@define-color borders                rgba(255, 255, 255, 0.06);
+
+/* ─── Base ───────────────────────────────────────────────── */
+
+* {
+    font-family: "Inter", "SF Pro Display", sans-serif;
+}
+
+window,
+.background,
+dialog {
+    background-color: @window_bg_color;
+    color: @window_fg_color;
+}
+
+label.dim-label,
+.dim-label {
+    color: #8e8e93;
+}
+
+/* ─── Header bars ────────────────────────────────────────── */
+
+headerbar,
+.titlebar {
+    background-color: #141416;
+    color: #f7f7f7;
+    border-bottom: 1px solid @borders;
+    min-height: 38px;
+}
+
+headerbar > windowhandle > box {
+    padding: 4px 6px;
+}
+
+windowcontrols button {
+    min-width: 22px;
+    min-height: 22px;
+    margin: 4px 2px;
+    padding: 0;
+    border-radius: 14px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border: none;
+    color: #8e8e93;
+    -gtk-icon-size: 12px;
+}
+
+windowcontrols button:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: #f7f7f7;
+}
+
+windowcontrols button.close {
+    background-color: rgba(255, 45, 45, 0.15);
+    color: #ff6b6b;
+}
+
+windowcontrols button.close:hover {
+    background-color: #ff2d2d;
+    color: #ffffff;
+}
+
+/* ─── Buttons ────────────────────────────────────────────── */
+
+button {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    color: #c8c8cc;
+    border-radius: 10px;
+    padding: 6px 14px;
+    box-shadow: none;
+    text-shadow: none;
+    transition:
+        background-color 120ms ease,
+        border-color 120ms ease,
+        color 120ms ease;
+}
+
+button:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+}
+
+button:active,
+button:checked {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+}
+
+button:disabled {
+    background-color: rgba(255, 255, 255, 0.02);
+    color: #4a4a4f;
+}
+
+button.suggested-action,
+button.suggested {
+    background-color: #ff2d2d;
+    border-color: #ff2d2d;
+    color: #ffffff;
+}
+
+button.suggested-action:hover,
+button.suggested:hover {
+    background-color: #ff4747;
+    border-color: #ff4747;
+}
+
+button.destructive-action,
+button.destructive {
+    background-color: transparent;
+    border-color: rgba(255, 45, 45, 0.4);
+    color: #ff6b6b;
+}
+
+button.destructive-action:hover,
+button.destructive:hover {
+    background-color: rgba(255, 45, 45, 0.1);
+    border-color: #ff2d2d;
+    color: #ffffff;
+}
+
+button.flat {
+    background: transparent;
+    border: none;
+}
+
+button.flat:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+button.circular {
+    border-radius: 9999px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+}
+
+button.pill {
+    border-radius: 9999px;
+    padding: 8px 18px;
+}
+
+/* ─── Entries ────────────────────────────────────────────── */
+
+entry,
+.entry,
+spinbutton {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    color: #f7f7f7;
+    caret-color: #ff2d2d;
+    padding: 8px 12px;
+    box-shadow: none;
+    min-height: 24px;
+    transition:
+        border-color 120ms ease,
+        background-color 120ms ease;
+}
+
+entry:focus,
+.entry:focus,
+spinbutton:focus {
+    border-color: rgba(255, 45, 45, 0.4);
+    background-color: rgba(255, 255, 255, 0.06);
+    outline: none;
+    box-shadow: none;
+}
+
+entry selection {
+    background-color: rgba(255, 45, 45, 0.3);
+    color: #ffffff;
+}
+
+entry image {
+    color: #8e8e93;
+}
+
+/* ─── Switch ─────────────────────────────────────────────── */
+
+switch {
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 14px;
+    min-width: 44px;
+    min-height: 22px;
+}
+
+switch:checked {
+    background-color: #ff2d2d;
+    border-color: #ff2d2d;
+}
+
+switch slider {
+    background-color: #ffffff;
+    border-radius: 50%;
+    border: none;
+    min-width: 18px;
+    min-height: 18px;
+    margin: 1px;
+}
+
+/* ─── Check / radio ──────────────────────────────────────── */
+
+check,
+radio,
+checkbutton check,
+checkbutton radio {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    min-width: 16px;
+    min-height: 16px;
+    -gtk-icon-source: none;
+}
+
+radio,
+checkbutton radio {
+    border-radius: 50%;
+}
+
+check:checked,
+radio:checked,
+checkbutton check:checked,
+checkbutton radio:checked {
+    background-color: #ff2d2d;
+    border-color: #ff2d2d;
+    color: #ffffff;
+}
+
+/* ─── Scrollbars — minimal ───────────────────────────────── */
+
+scrollbar {
+    background: transparent;
+    border: none;
+}
+
+scrollbar slider {
+    background-color: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    min-width: 6px;
+    min-height: 6px;
+    margin: 2px;
+    border: none;
+}
+
+scrollbar slider:hover {
+    background-color: rgba(255, 255, 255, 0.3);
+}
+
+scrollbar slider:active {
+    background-color: #ff2d2d;
+}
+
+/* ─── Scale (slider) ─────────────────────────────────────── */
+
+scale trough {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    min-height: 4px;
+    min-width: 4px;
+    border: none;
+}
+
+scale highlight {
+    background-color: #ffffff;
+    border-radius: 4px;
+}
+
+scale slider {
+    background-color: #ffffff;
+    border: none;
+    border-radius: 50%;
+    min-width: 14px;
+    min-height: 14px;
+    margin: -5px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+/* ─── Progressbar ────────────────────────────────────────── */
+
+progressbar trough {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    border: none;
+    min-height: 4px;
+}
+
+progressbar progress {
+    background-color: #ff2d2d;
+    border-radius: 4px;
+}
+
+/* ─── Popovers / menus ───────────────────────────────────── */
+
+popover,
+popover.menu,
+.popover {
+    background-color: #1a1a1d;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 14px;
+    padding: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    color: #f7f7f7;
+}
+
+popover modelbutton,
+popover button.flat,
+popover .menuitem {
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: transparent;
+    color: #f7f7f7;
+}
+
+popover modelbutton:hover,
+popover button.flat:hover,
+popover .menuitem:hover {
+    background-color: rgba(255, 45, 45, 0.1);
+}
+
+/* ─── Tooltip ────────────────────────────────────────────── */
+
+tooltip {
+    background-color: #1a1a1d;
+    color: #c8c8cc;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 8px 12px;
+}
+
+tooltip label {
+    color: #c8c8cc;
+    font-family: "Inter", sans-serif;
+    font-size: 11px;
+}
+
+/* ─── Notebook / tabs ────────────────────────────────────── */
+
+notebook header {
+    background-color: #141416;
+    border: none;
+}
+
+notebook header.top {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+notebook tab {
+    background: transparent;
+    color: #8e8e93;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+notebook tab:hover {
+    color: #f7f7f7;
+    background-color: rgba(255, 255, 255, 0.04);
+}
+
+notebook tab:checked {
+    color: #f7f7f7;
+    box-shadow: inset 0 -2px 0 #ff2d2d;
+}
+
+/* ─── List / row ─────────────────────────────────────────── */
+
+list,
+list row,
+listview row {
+    background-color: transparent;
+    color: #f7f7f7;
+}
+
+list row,
+listview row {
+    padding: 4px;
+    border-radius: 8px;
+    transition: background-color 120ms ease;
+}
+
+list row:hover,
+listview row:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+list row:selected,
+listview row:selected {
+    background-color: rgba(255, 45, 45, 0.1);
+    color: #f7f7f7;
+}
+
+/* ─── Sidebar ────────────────────────────────────────────── */
+
+.sidebar,
+stacksidebar,
+sidebar {
+    background-color: #141416;
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sidebar row,
+stacksidebar row {
+    border-radius: 8px;
+    margin: 2px 8px;
+    padding: 8px 12px;
+    color: #c8c8cc;
+}
+
+.sidebar row:hover,
+stacksidebar row:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #f7f7f7;
+}
+
+.sidebar row:selected,
+stacksidebar row:selected {
+    background-color: #ff2d2d;
+    color: #ffffff;
+}
+
+/* ─── Toolbar ────────────────────────────────────────────── */
+
+toolbar {
+    background-color: #141416;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ─── Status bar ─────────────────────────────────────────── */
+
+statusbar {
+    background-color: #141416;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    color: #8e8e93;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+}
+
+/* ─── Spinner ────────────────────────────────────────────── */
+
+spinner {
+    color: #ff2d2d;
+}
+
+/* ─── Links ──────────────────────────────────────────────── */
+
+link,
+*:link {
+    color: #ff2d2d;
+}
+
+link:hover {
+    color: #ff4747;
+}
+
+/* ─── Selection (text) ───────────────────────────────────── */
+
+selection,
+textview text selection {
+    background-color: rgba(255, 45, 45, 0.3);
+    color: #ffffff;
+}
+
+textview,
+textview text {
+    background-color: #141416;
+    color: #f7f7f7;
+    caret-color: #ff2d2d;
+}
+
+/* ─── Calendar ───────────────────────────────────────────── */
+
+calendar {
+    background-color: #141416;
+    color: #f7f7f7;
+    border-radius: 10px;
+}
+
+calendar:selected {
+    background-color: #ff2d2d;
+    color: #ffffff;
+    border-radius: 50%;
+}
+
+/* ─── AdwToastOverlay / toasts ───────────────────────────── */
+
+toast {
+    background-color: #1a1a1d;
+    color: #f7f7f7;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 10px 14px;
+}
+
+/* ─── Banner ─────────────────────────────────────────────── */
+
+banner > revealer > widget {
+    background-color: rgba(255, 45, 45, 0.1);
+    border-bottom: 1px solid rgba(255, 45, 45, 0.3);
+}
+
+/* ═══ NOTHING OS POPUP FIX — BEGIN ═══ */
+/* Removes shadow/backdrop bleeding under layer-shell popups */
+
+window.popup-window,
+window.popup-window > * {
+    background: transparent;
+    background-color: transparent;
+}
+
+window.popup-window {
+    box-shadow: none;
+    border: none;
+    outline: none;
+}
+
+window.popup-window decoration,
+window.popup-window > decoration {
+    background: transparent;
+    box-shadow: none;
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+
+/* libadwaita's window-level CSD shadow */
+window.popup-window.solid-csd,
+window.popup-window.csd {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+    border: none;
+}
+
+/* The .background class is automatically added by GTK to all toplevels */
+window.popup-window.background {
+    background: transparent;
+    background-color: transparent;
+}
+
+/* Adw.ApplicationWindow direct child container */
+window.popup-window > windowhandle,
+window.popup-window > box {
+    background: transparent;
+    background-color: transparent;
+    box-shadow: none;
+}
+
+/* Focus outline cleanup */
+window.popup-window:focus,
+window.popup-window:focus-visible,
+window.popup-window:focus-within {
+    outline: none;
+    box-shadow: none;
+}
+
+window.popup-window *:focus-visible {
+    outline: none;
+}
+
+/* Adwaita banner / toast bleeding */
+window.popup-window banner,
+window.popup-window toast {
+    background: transparent;
+}
+
+/* ═══ NOTHING OS POPUP FIX — END ═══ */

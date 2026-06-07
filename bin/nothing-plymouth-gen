@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Generate Plymouth theme assets for Nothing OS boot screen."""
+
+import sys
+import math
+from pathlib import Path
+
+try:
+    import cairo
+except ImportError:
+    print("Install: pip install pycairo", file=sys.stderr)
+    sys.exit(1)
+
+OUT_DIR = Path('/tmp/nothing-plymouth')
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Palette
+RED       = (1.000, 0.176, 0.176)
+WHITE_85  = (1, 1, 1, 0.85)
+WHITE_06  = (1, 1, 1, 0.06)
+
+# ─── NDot font (5x7) for "NOTHING OS" ──────────────────────
+
+NDOT = {
+    'N':["10001","11001","10101","10011","10001","10001","10001"],
+    'O':["01110","10001","10001","10001","10001","10001","01110"],
+    'T':["11111","00100","00100","00100","00100","00100","00100"],
+    'H':["10001","10001","10001","11111","10001","10001","10001"],
+    'I':["01110","00100","00100","00100","00100","00100","01110"],
+    'G':["01110","10001","10000","10011","10001","10001","01110"],
+    'S':["01111","10000","10000","01110","00001","00001","11110"],
+    ' ':["00000","00000","00000","00000","00000","00000","00000"],
+}
+
+
+def gen_glyph_dot():
+    """Small red dot (top-left brand marker), 20x20."""
+    size = 20
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(s)
+    cr.set_source_rgba(*RED, 1.0)
+    cr.arc(size/2, size/2, 5, 0, 2*math.pi)
+    cr.fill()
+    s.write_to_png(str(OUT_DIR / 'glyph-dot.png'))
+
+
+def gen_ndot_logo():
+    """Big NDot 'OS' centered logo (concentric dot pattern)."""
+    size = 240
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(s)
+    cx, cy = size/2, size/2
+
+    # Concentric rings of red dots (Nothing glyph)
+    rings = [
+        (0,       1,  4.5),
+        (size*0.13,  8,  4.0),
+        (size*0.26, 14, 3.5),
+        (size*0.39, 22, 3.0),
+    ]
+
+    for radius, count, dot_size in rings:
+        if count == 1:
+            cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, dot_size, 0, 2*math.pi)
+            cr.fill()
+            continue
+        for i in range(count):
+            a = (i / count) * 2 * math.pi
+            x = cx + math.cos(a) * radius
+            y = cy + math.sin(a) * radius
+            cr.set_source_rgba(*RED, 0.9)
+            cr.arc(x, y, dot_size, 0, 2*math.pi)
+            cr.fill()
+
+    s.write_to_png(str(OUT_DIR / 'ndot-logo.png'))
+
+
+def gen_subtitle():
+    """Render 'NOTHING OS' in NDot, centered."""
+    text = 'NOTHING OS'
+    cell = 6
+    char_w = 5 * cell
+    gap = cell * 0.7
+    total_w = len(text) * char_w + (len(text) - 1) * gap
+    total_h = 7 * cell
+    padding = 12
+    w = int(total_w + padding * 2)
+    h = int(total_h + padding * 2)
+
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    cr = cairo.Context(s)
+
+    dot_r = cell * 0.40
+    x_cursor = padding
+    for ch in text:
+        glyph = NDOT.get(ch, NDOT[' '])
+        for r in range(7):
+            for c in range(5):
+                if glyph[r][c] == '1':
+                    px = x_cursor + c * cell + cell/2
+                    py = padding + r * cell + cell/2
+                    cr.set_source_rgba(*WHITE_85)
+                    cr.arc(px, py, dot_r, 0, 2*math.pi)
+                    cr.fill()
+        x_cursor += char_w + gap
+
+    s.write_to_png(str(OUT_DIR / 'subtitle.png'))
+
+
+def gen_progress_dots():
+    """Single dot — off and on states."""
+    size = 8
+    # Off dot (dim)
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(s)
+    cr.set_source_rgba(*WHITE_06)
+    cr.arc(size/2, size/2, 2.5, 0, 2*math.pi)
+    cr.fill()
+    s.write_to_png(str(OUT_DIR / 'dot-off.png'))
+
+    # On dot (red)
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(s)
+    cr.set_source_rgb(*RED)
+    cr.arc(size/2, size/2, 3.5, 0, 2*math.pi)
+    cr.fill()
+    s.write_to_png(str(OUT_DIR / 'dot-on.png'))
+
+
+def gen_background():
+    """Solid dark bg with film grain (1920x1080)."""
+    import random
+    w, h = 1920, 1080
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    cr = cairo.Context(s)
+    cr.set_source_rgb(0.059, 0.059, 0.067)  # #0F0F11
+    cr.rectangle(0, 0, w, h)
+    cr.fill()
+
+    # Subtle film grain
+    random.seed(7)
+    density = int(w * h * 0.04)
+    for _ in range(density):
+        x = random.uniform(0, w)
+        y = random.uniform(0, h)
+        brightness = random.gauss(0.5, 0.2)
+        brightness = max(0, min(1, brightness))
+        alpha = random.uniform(0, 0.06)
+        cr.set_source_rgba(brightness, brightness, brightness, alpha)
+        cr.arc(x, y, 0.5, 0, 2*math.pi)
+        cr.fill()
+
+    s.write_to_png(str(OUT_DIR / 'background.png'))
+
+
+def main():
+    print(f"Generating Plymouth assets in {OUT_DIR}")
+    gen_background()
+    gen_glyph_dot()
+    gen_ndot_logo()
+    gen_subtitle()
+    gen_progress_dots()
+    print("✓ Done. Now run:")
+    print(f"  sudo cp {OUT_DIR}/*.png /usr/share/plymouth/themes/nothing-os/")
+    print("  sudo plymouth-set-default-theme -R nothing-os")
+
+
+if __name__ == '__main__':
+    main()

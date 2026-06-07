@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Top Bar (waybar replacement)
+Full DNA: dot-matrix clock, breathing dots, pulse indicators
+"""
+
+import os
+import sys
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        '/usr/lib/libgtk4-layer-shell.so',
+        '/usr/lib/libgtk4-layer-shell.so.0',
+        '/usr/lib64/libgtk4-layer-shell.so',
+        '/usr/lib64/libgtk4-layer-shell.so.0',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0',
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get('LD_PRELOAD', '')
+    if lib_path in current:
+        return
+    os.environ['LD_PRELOAD'] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+try:
+    gi.require_version('Gtk4LayerShell', '1.0')
+    from gi.repository import Gtk4LayerShell as LayerShell
+except (ValueError, ImportError):
+    print("[error] gtk4-layer-shell required", file=sys.stderr)
+    sys.exit(1)
+
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, Pango
+import subprocess
+import re
+import signal
+import shutil
+import math
+import json as _json
+from pathlib import Path
+from datetime import datetime
+
+sys.path.insert(0, str(Path.home() / '.local/lib/nothing-os'))
+from nothing_dna import (
+    DotGlyph, HeartbeatDot, Color, SHARED_CSS,
+)
+
+CONFIG_DIR = Path.home() / '.config' / 'nothing-bar'
+CONFIG_FILE = CONFIG_DIR / 'config.ini'
+
+DEFAULTS = {
+    'height': '36',
+    'position': 'top',
+    'cmd_control': 'nothing-control --toggle',
+    'cmd_volume': 'nothing-volume --toggle',
+    'cmd_bluetooth': 'nothing-bluetooth --toggle',
+    'cmd_network': 'nothing-network --toggle',
+    'cmd_calendar': 'nothing-calendar --toggle',
+    'cmd_notifications': 'nothing-notifications --toggle',
+    'cmd_launcher': 'nothing-launcher --toggle',
+    'cmd_clipboard': 'nothing-clipboard --toggle',
+    'cmd_about': 'nothing-about --toggle',
+}
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if not CONFIG_FILE.exists():
+        return cfg
+    try:
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            cfg[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return cfg
+
+
+# ── Backends ────────────────────────────────────────────────────
+
+def run(cmd, timeout=2):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              check=False, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def run_async(cmd):
+    try:
+        env = os.environ.copy()
+        env.pop('LD_PRELOAD', None)
+        subprocess.Popen(cmd, shell=True, env=env,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        pass
+
+
+class Hypr:
+    @staticmethod
+    def available():
+        return os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') is not None
+
+    @staticmethod
+    def workspaces():
+        out = run(['hyprctl', 'workspaces', '-j'])
+        if not out:
+            return []
+        try:
+            return sorted(_json.loads(out), key=lambda x: x['id'])
+        except Exception:
+            return []
+
+    @staticmethod
+    def active_workspace():
+        out = run(['hyprctl', 'activeworkspace', '-j'])
+        if not out:
+            return None
+        try:
+            return _json.loads(out)
+        except Exception:
+            return None
+
+    @staticmethod
+    def active_window():
+        out = run(['hyprctl', 'activewindow', '-j'])
+        if not out:
+            return None
+        try:
+            return _json.loads(out)
+        except Exception:
+            return None
+
+    @staticmethod
+    def switch(wid):
+        subprocess.run(['hyprctl', 'dispatch', 'workspace', str(wid)],
+                       check=False)
+
+
+class Sys:
+    _last_idle = None
+    _last_total = None
+
+    @staticmethod
+    def cpu():
+        try:
+            with open('/proc/stat') as f:
+                line = f.readline()
+            parts = [int(x) for x in line.split()[1:]]
+            idle = parts[3]
+            total = sum(parts)
+            if Sys._last_idle is None:
+                Sys._last_idle = idle
+                Sys._last_total = total
+                return 0
+            di = idle - Sys._last_idle
+            dt = total - Sys._last_total
+            Sys._last_idle = idle
+            Sys._last_total = total
+            if dt <= 0:
+                return 0
+            return int((1 - di / dt) * 100)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def mem():
+        try:
+            mt = ma = 0
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        mt = int(line.split()[1])
+                    elif line.startswith('MemAvailable:'):
+                        ma = int(line.split()[1])
+                    if mt and ma:
+                        break
+            if mt > 0:
+                return int(((mt - ma) / mt) * 100)
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def battery():
+        for bat in Path('/sys/class/power_supply').glob('BAT*'):
+            try:
+                cap = int((bat / 'capacity').read_text().strip())
+                status = (bat / 'status').read_text().strip().lower()
+                return cap, status == 'charging'
+            except Exception:
+                continue
+        return None, None
+
+
+class Audio:
+    @staticmethod
+    def volume():
+        out = run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'])
+        m = re.search(r'(\d+)%', out)
+        return int(m.group(1)) if m else 0
+
+    @staticmethod
+    def muted():
+        return 'yes' in run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'])
+
+
+class Net:
+    @staticmethod
+    def ssid():
+        out = run(['nmcli', '-t', '-f', 'ACTIVE,SSID', 'device', 'wifi'])
+        for line in out.split('\n'):
+            if line.startswith('yes:'):
+                return line.split(':', 1)[1].replace('\\:', ':')
+        return None
+
+    @staticmethod
+    def ethernet():
+        out = run(['nmcli', '-t', '-f', 'TYPE,STATE', 'device', 'status'])
+        for line in out.split('\n'):
+            parts = line.split(':')
+            if len(parts) >= 2 and parts[0] == 'ethernet' and parts[1] == 'connected':
+                return True
+        return False
+
+    @staticmethod
+    def wifi_on():
+        return 'enabled' in run(['nmcli', 'radio', 'wifi']).lower()
+
+
+class BT:
+    @staticmethod
+    def on():
+        out = run(['bluetoothctl', 'show'])
+        m = re.search(r'Powered:\s*(yes|no)', out)
+        return bool(m and m.group(1) == 'yes')
+
+
+# ── Custom dot-row decorator (animated breathing line) ──────────
+
+class BreathingLine(Gtk.DrawingArea):
+    """Single horizontal row of dots that breathes."""
+
+    def __init__(self, cols=8, dot_size=2, spacing=5, opacity=0.5):
+        super().__init__()
+        self.cols = cols
+        self.dot_size = dot_size
+        self.spacing = spacing
+        self.opacity = opacity
+        self.phase = 0.0
+        self.set_content_width(cols * spacing)
+        self.set_content_height(dot_size + 4)
+        self.set_draw_func(self._draw)
+        GLib.timeout_add(80, self._tick)
+
+    def _tick(self):
+        self.phase = (self.phase + 0.1) % (2 * math.pi)
+        self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        cy = h / 2
+        for i in range(self.cols):
+            x = i * self.spacing + self.spacing / 2
+            wave = math.sin(self.phase + i * 0.5) * 0.3 + 0.7
+            alpha = self.opacity * wave
+            cr.set_source_rgba(0.84, 0.19, 0.19, alpha)
+            cr.arc(x, cy, self.dot_size / 2, 0, 6.2832)
+            cr.fill()
+
+
+# ── Bar Modules ─────────────────────────────────────────────────
+
+class BarButton(Gtk.Button):
+    """Click-handling module."""
+    def __init__(self, on_click=None, on_right_click=None):
+        super().__init__()
+        self.add_css_class('bar-module')
+        self.set_can_focus(False)
+        if on_click:
+            self.connect('clicked', lambda b: on_click())
+        if on_right_click:
+            click = Gtk.GestureClick()
+            click.set_button(3)
+            click.connect('pressed', lambda *a: on_right_click())
+            self.add_controller(click)
+
+
+class LauncherButton(BarButton):
+    def __init__(self, on_click):
+        super().__init__(on_click=on_click)
+        self.add_css_class('module-launcher')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # Heartbeat as "alive" indicator
+        heart = HeartbeatDot(size=10, color=Color.RED, active=True)
+        heart.set_valign(Gtk.Align.CENTER)
+        box.append(heart)
+
+        lbl = Gtk.Label(label='RUN')
+        lbl.add_css_class('launcher-label')
+        box.append(lbl)
+
+        self.set_child(box)
+
+
+class WorkspacesModule(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.add_css_class('module-workspaces')
+        self.buttons = {}
+        self._build()
+
+    def _build(self):
+        if not Hypr.available():
+            self.set_visible(False)
+            return
+
+        for i in range(1, 11):
+            btn = Gtk.Button(label=str(i))
+            btn.add_css_class('ws-btn')
+            btn.set_can_focus(False)
+            btn.connect('clicked', lambda b, wid=i: Hypr.switch(wid))
+            self.buttons[i] = btn
+            self.append(btn)
+
+    def refresh(self):
+        if not Hypr.available():
+            return
+        active = Hypr.active_workspace()
+        active_id = active['id'] if active else None
+        existing = {ws['id']: ws for ws in Hypr.workspaces()}
+
+        for wid, btn in self.buttons.items():
+            if wid == active_id:
+                btn.add_css_class('active')
+                btn.remove_css_class('occupied')
+            elif wid in existing and existing[wid].get('windows', 0) > 0:
+                btn.add_css_class('occupied')
+                btn.remove_css_class('active')
+            else:
+                btn.remove_css_class('active')
+                btn.remove_css_class('occupied')
+
+
+class TitleModule(Gtk.Box):
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.add_css_class('module-title')
+
+        self.dot = Gtk.Label(label='●')
+        self.dot.add_css_class('title-dot')
+        self.append(self.dot)
+
+        self.lbl = Gtk.Label(label='', xalign=0.5)
+        self.lbl.add_css_class('title-text')
+        self.lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.lbl.set_max_width_chars(60)
+        self.append(self.lbl)
+
+    def refresh(self):
+        if not Hypr.available():
+            self.set_visible(False)
+            return
+        win = Hypr.active_window()
+        if win and win.get('title'):
+            title = win['title']
+            if len(title) > 70:
+                title = title[:67] + '…'
+            self.lbl.set_text(title)
+            self.dot.add_css_class('active')
+        else:
+            self.lbl.set_text('— desktop —')
+            self.dot.remove_css_class('active')
+
+
+class ClockModule(BarButton):
+    """Dot-matrix HH:MM time."""
+    def __init__(self, on_click=None):
+        super().__init__(on_click=on_click)
+        self.add_css_class('module-clock')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+
+        # Date as plain text (small)
+        self.date_lbl = Gtk.Label()
+        self.date_lbl.add_css_class('clock-date')
+        self.date_lbl.set_valign(Gtk.Align.CENTER)
+        box.append(self.date_lbl)
+
+        sep = Gtk.Label(label='│')
+        sep.add_css_class('clock-sep')
+        box.append(sep)
+
+        # Time as DOT-MATRIX
+        self.time_glyph = DotGlyph(
+            text='00:00', dot_size=2, gap=1, char_gap=2,
+            color=Color.TEXT_HI, show_grid=True, dim_alpha=0.07,
+        )
+        self.time_glyph.set_valign(Gtk.Align.CENTER)
+        box.append(self.time_glyph)
+
+        self.set_child(box)
+        self.refresh()
+
+    def refresh(self):
+        now = datetime.now()
+        self.date_lbl.set_text(now.strftime('%a · %d %b').upper())
+        self.time_glyph.set_text(now.strftime('%H:%M'))
+
+
+class StatusModule(BarButton):
+    """Glyph + small dot-matrix value (e.g., audio %)"""
+    def __init__(self, glyph, on_click=None, on_right_click=None,
+                 use_dotmatrix=False):
+        super().__init__(on_click=on_click, on_right_click=on_right_click)
+        self.add_css_class('module-status')
+        self.use_dotmatrix = use_dotmatrix
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.glyph = Gtk.Label(label=glyph)
+        self.glyph.add_css_class('status-glyph')
+        box.append(self.glyph)
+
+        if use_dotmatrix:
+            self.value_glyph = DotGlyph(
+                text='--', dot_size=2, gap=1, char_gap=2,
+                color=Color.TEXT_HI, show_grid=False,
+            )
+            self.value_glyph.set_valign(Gtk.Align.CENTER)
+            box.append(self.value_glyph)
+            self.value_label = None
+        else:
+            self.value_label = Gtk.Label(label='')
+            self.value_label.add_css_class('status-text')
+            box.append(self.value_label)
+            self.value_glyph = None
+
+        self.set_child(box)
+
+    def update(self, value, active=True):
+        if self.value_glyph:
+            self.value_glyph.set_text(value)
+            self.value_glyph.set_color(Color.TEXT_HI if active else Color.TEXT_LOW)
+        else:
+            self.value_label.set_text(value)
+
+        if active:
+            self.add_css_class('active')
+            self.glyph.add_css_class('active')
+        else:
+            self.remove_css_class('active')
+            self.glyph.remove_css_class('active')
+
+
+class SysMeterModule(BarButton):
+    """CPU/MEM percent with mini dots."""
+    def __init__(self, on_click=None):
+        super().__init__(on_click=on_click)
+        self.add_css_class('module-sysmeter')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        cpu_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        cpu_lbl = Gtk.Label(label='C')
+        cpu_lbl.add_css_class('sysmeter-letter')
+        cpu_box.append(cpu_lbl)
+        self.cpu_glyph = DotGlyph(
+            text='0', dot_size=2, gap=1, char_gap=2,
+            color=Color.TEXT_HI, show_grid=False,
+        )
+        cpu_box.append(self.cpu_glyph)
+        box.append(cpu_box)
+
+        sep = Gtk.Label(label='·')
+        sep.add_css_class('sysmeter-sep')
+        box.append(sep)
+
+        mem_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        mem_lbl = Gtk.Label(label='M')
+        mem_lbl.add_css_class('sysmeter-letter')
+        mem_box.append(mem_lbl)
+        self.mem_glyph = DotGlyph(
+            text='0', dot_size=2, gap=1, char_gap=2,
+            color=Color.TEXT_HI, show_grid=False,
+        )
+        mem_box.append(self.mem_glyph)
+        box.append(mem_box)
+
+        self.set_child(box)
+
+    def refresh(self):
+        cpu = Sys.cpu()
+        mem = Sys.mem()
+        self.cpu_glyph.set_text(str(cpu))
+        self.mem_glyph.set_text(str(mem))
+        self.cpu_glyph.set_color(Color.RED if cpu > 80 else Color.TEXT_HI)
+        self.mem_glyph.set_color(Color.RED if mem > 85 else Color.TEXT_HI)
+
+
+class BatteryModule(BarButton):
+    """Battery with charge state."""
+    def __init__(self, on_click=None):
+        super().__init__(on_click=on_click)
+        self.add_css_class('module-battery')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.glyph = Gtk.Label(label='▮')
+        self.glyph.add_css_class('status-glyph')
+        box.append(self.glyph)
+
+        self.value_glyph = DotGlyph(
+            text='--', dot_size=2, gap=1, char_gap=2,
+            color=Color.TEXT_HI, show_grid=False,
+        )
+        self.value_glyph.set_valign(Gtk.Align.CENTER)
+        box.append(self.value_glyph)
+
+        self.set_child(box)
+
+    def refresh(self):
+        lvl, charging = Sys.battery()
+        if lvl is None:
+            self.set_visible(False)
+            return
+        self.set_visible(True)
+
+        text = str(lvl)
+        self.value_glyph.set_text(text)
+
+        if charging:
+            self.glyph.set_text('⚡')
+            self.glyph.add_css_class('active')
+            self.value_glyph.set_color(Color.GREEN)
+            self.add_css_class('charging')
+            self.remove_css_class('low')
+        elif lvl <= 20:
+            self.glyph.set_text('▮')
+            self.glyph.add_css_class('active')
+            self.value_glyph.set_color(Color.RED)
+            self.add_css_class('low')
+            self.remove_css_class('charging')
+        else:
+            self.glyph.set_text('▮')
+            self.glyph.remove_css_class('active')
+            self.value_glyph.set_color(Color.TEXT_HI)
+            self.remove_css_class('low')
+            self.remove_css_class('charging')
+
+
+# ── Bar Window ──────────────────────────────────────────────────
+
+class NothingBar(Adw.ApplicationWindow):
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self.cfg = load_config()
+        self.set_title('nothing-bar')
+        self.add_css_class('bar-window')
+
+        height = int(self.cfg['height'])
+
+        LayerShell.init_for_window(self)
+        LayerShell.set_namespace(self, 'nothing-bar')
+        LayerShell.set_layer(self, LayerShell.Layer.TOP)
+        LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
+        LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+        if self.cfg['position'] == 'bottom':
+            LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, True)
+        else:
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+        LayerShell.set_exclusive_zone(self, height)
+
+        self.set_default_size(-1, height)
+
+        # ── Layout ──────────────────────────────────────────────
+        root = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        root.add_css_class('bar-root')
+
+        # LEFT
+        left = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        left.set_margin_start(12)
+        left.set_margin_top(2)
+        left.set_margin_bottom(2)
+
+        self.launcher = LauncherButton(
+            on_click=lambda: run_async(self.cfg['cmd_launcher']))
+        left.append(self.launcher)
+
+        # Breathing dots separator
+        bd1 = BreathingLine(cols=6, dot_size=2, spacing=5, opacity=0.35)
+        bd1.set_valign(Gtk.Align.CENTER)
+        bd1.set_margin_start(4)
+        bd1.set_margin_end(4)
+        left.append(bd1)
+
+        self.workspaces = WorkspacesModule()
+        left.append(self.workspaces)
+
+        root.append(left)
+
+        # CENTER (window title)
+        center = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        center.set_hexpand(True)
+        center.set_halign(Gtk.Align.CENTER)
+
+        self.title = TitleModule()
+        center.append(self.title)
+
+        root.append(center)
+
+        # RIGHT
+        right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        right.set_margin_end(12)
+        right.set_margin_top(2)
+        right.set_margin_bottom(2)
+
+        self.sysmeter = SysMeterModule(
+            on_click=lambda: run_async(self.cfg['cmd_control']))
+        right.append(self.sysmeter)
+
+        # Breathing dots separator
+        bd2 = BreathingLine(cols=6, dot_size=2, spacing=5, opacity=0.35)
+        bd2.set_valign(Gtk.Align.CENTER)
+        bd2.set_margin_start(4)
+        bd2.set_margin_end(4)
+        right.append(bd2)
+
+        self.battery = BatteryModule(
+            on_click=lambda: run_async(self.cfg['cmd_control']))
+        right.append(self.battery)
+
+        self.audio = StatusModule(
+            glyph='♫', use_dotmatrix=True,
+            on_click=lambda: run_async(self.cfg['cmd_volume']))
+        right.append(self.audio)
+
+        self.network = StatusModule(
+            glyph='≋', use_dotmatrix=False,
+            on_click=lambda: run_async(self.cfg['cmd_network']))
+        right.append(self.network)
+
+        self.bluetooth = StatusModule(
+            glyph='✦', use_dotmatrix=False,
+            on_click=lambda: run_async(self.cfg['cmd_bluetooth']))
+        right.append(self.bluetooth)
+
+        # Breathing dots separator
+        bd3 = BreathingLine(cols=6, dot_size=2, spacing=5, opacity=0.35)
+        bd3.set_valign(Gtk.Align.CENTER)
+        bd3.set_margin_start(4)
+        bd3.set_margin_end(4)
+        right.append(bd3)
+
+        self.clock = ClockModule(
+            on_click=lambda: run_async(self.cfg['cmd_calendar']))
+        right.append(self.clock)
+
+        # Clipboard button
+        self.clip_btn = BarButton(
+            on_click=lambda: run_async(self.cfg['cmd_clipboard']))
+        self.clip_btn.add_css_class('module-icon')
+        clip_ico = Gtk.Label(label='⎘')
+        clip_ico.add_css_class('status-glyph')
+        self.clip_btn.set_child(clip_ico)
+        right.append(self.clip_btn)
+
+        # Notifications button (with heartbeat)
+        self.notif_btn = BarButton(
+            on_click=lambda: run_async(self.cfg['cmd_notifications']))
+        self.notif_btn.add_css_class('module-icon')
+        notif_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        notif_ico = Gtk.Label(label='✉')
+        notif_ico.add_css_class('status-glyph')
+        notif_box.append(notif_ico)
+        self.notif_btn.set_child(notif_box)
+        right.append(self.notif_btn)
+
+        # About button
+        self.about_btn = BarButton(
+            on_click=lambda: run_async(self.cfg['cmd_about']))
+        self.about_btn.add_css_class('module-icon')
+        self.about_btn.add_css_class('about-btn')
+        about_ico = Gtk.Label(label='●')
+        about_ico.add_css_class('about-glyph')
+        self.about_btn.set_child(about_ico)
+        right.append(self.about_btn)
+
+        root.append(right)
+
+        self.set_content(root)
+
+        self.refresh_all()
+        self._fast_timer = GLib.timeout_add(2000, self._fast_refresh)
+        self._slow_timer = GLib.timeout_add(5000, self._slow_refresh)
+        self._title_timer = GLib.timeout_add(500, self._title_refresh)
+
+    def refresh_all(self):
+        self._fast_refresh()
+        self._slow_refresh()
+        self._title_refresh()
+
+    def _fast_refresh(self):
+        self.workspaces.refresh()
+        self.clock.refresh()
+        self.sysmeter.refresh()
+
+        vol = Audio.volume()
+        muted = Audio.muted()
+        if muted:
+            self.audio.update('--', active=False)
+            self.audio.glyph.set_text('⊘')
+        else:
+            self.audio.update(str(vol), active=True)
+            if vol == 0:
+                self.audio.glyph.set_text('○')
+            elif vol < 40:
+                self.audio.glyph.set_text('◔')
+            elif vol < 75:
+                self.audio.glyph.set_text('◑')
+            else:
+                self.audio.glyph.set_text('●')
+
+        return True
+
+    def _slow_refresh(self):
+        ssid = Net.ssid()
+        if ssid:
+            label = ssid if len(ssid) <= 10 else ssid[:8] + '…'
+            self.network.update(label, active=True)
+            self.network.glyph.set_text('≋')
+        elif Net.ethernet():
+            self.network.update('ETH', active=True)
+            self.network.glyph.set_text('⏚')
+        elif Net.wifi_on():
+            self.network.update('—', active=False)
+            self.network.glyph.set_text('≋')
+        else:
+            self.network.update('OFF', active=False)
+            self.network.glyph.set_text('⊘')
+
+        if BT.on():
+            self.bluetooth.update('ON', active=True)
+        else:
+            self.bluetooth.update('OFF', active=False)
+
+        self.battery.refresh()
+        return True
+
+    def _title_refresh(self):
+        self.title.refresh()
+        return True
+
+
+class NothingBarApp(Adw.Application):
+
+    def __init__(self):
+        super().__init__(
+            application_id='tech.nothing.bar',
+            flags=Gio.ApplicationFlags.FLAGS_NONE
+        )
+        self.window = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        self._load_css()
+
+    def do_activate(self):
+        if not self.window:
+            self.window = NothingBar(self)
+        self.window.present()
+
+    def _load_css(self):
+        css_provider = Gtk.CssProvider()
+        css_path = CONFIG_DIR / 'style.css'
+        if css_path.exists():
+            css_provider.load_from_path(str(css_path))
+        else:
+            css_provider.load_from_data((SHARED_CSS + APP_CSS).encode())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+
+APP_CSS = """
+window.bar-window { background: transparent; }
+
+.bar-root {
+    background: #080808;
+    border-bottom: 1px solid #1F1F1F;
+}
+
+.bar-module {
+    background: transparent;
+    border: none;
+    padding: 4px 12px;
+    box-shadow: none;
+    border-radius: 6px;
+    transition: all 120ms ease;
+    min-height: 28px;
+}
+.bar-module:hover {
+    background: #161616;
+}
+
+/* Launcher */
+.module-launcher {
+    padding: 4px 14px;
+    background: #0C0C0C;
+    border: 1px solid #1F1F1F;
+}
+.module-launcher:hover {
+    background: #120606;
+    border-color: #D63030;
+}
+
+.launcher-label {
+    font-family: "NDot 55", "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: #E8E6E3;
+    font-weight: 800;
+    letter-spacing: 2px;
+}
+
+/* Workspaces */
+.module-workspaces { padding: 0 4px; }
+
+.ws-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #444444;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 6px;
+    padding: 0;
+    min-width: 26px;
+    min-height: 26px;
+    box-shadow: none;
+    transition: all 120ms ease;
+}
+.ws-btn:hover {
+    background: #161616;
+    color: #888888;
+}
+.ws-btn.occupied {
+    color: #888888;
+    background: #0C0C0C;
+    border-color: #1F1F1F;
+}
+.ws-btn.active {
+    background: #D63030;
+    color: #FFFFFF;
+    border-color: #D63030;
+    text-shadow: 0 0 6px rgba(255, 255, 255, 0.4);
+}
+
+/* Title */
+.module-title {
+    padding: 4px 10px;
+}
+.title-dot {
+    font-family: monospace;
+    font-size: 8px;
+    color: #2A2A2A;
+}
+.title-dot.active {
+    color: #D63030;
+    text-shadow: 0 0 6px rgba(214, 48, 48, 0.6);
+}
+.title-text {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    color: #666666;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+}
+
+/* Clock */
+.module-clock { padding: 4px 12px; }
+.clock-date {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    color: #555555;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+.clock-sep {
+    font-family: monospace;
+    font-size: 12px;
+    color: #1F1F1F;
+}
+
+/* Status modules */
+.status-glyph {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+    color: #444444;
+    font-weight: 700;
+}
+.status-glyph.active {
+    color: #D63030;
+    text-shadow: 0 0 6px rgba(214, 48, 48, 0.5);
+}
+.status-text {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10px;
+    color: #666666;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+.module-status.active .status-text {
+    color: #E8E6E3;
+}
+
+/* Battery */
+.module-battery.low .status-glyph {
+    color: #D63030;
+    text-shadow: 0 0 8px rgba(214, 48, 48, 0.8);
+}
+.module-battery.charging .status-glyph {
+    color: #4CAF50;
+    text-shadow: 0 0 6px rgba(76, 175, 80, 0.6);
+}
+
+/* System meter (CPU/MEM) */
+.module-sysmeter { padding: 4px 10px; }
+.sysmeter-letter {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    color: #D63030;
+    font-weight: 800;
+}
+.sysmeter-sep {
+    font-family: monospace;
+    font-size: 10px;
+    color: #2A2A2A;
+}
+
+/* Icon buttons (clipboard / notif / about) */
+.module-icon { padding: 4px 10px; }
+
+.about-btn {
+    background: #0C0C0C;
+    border: 1px solid #2A1010;
+    padding: 4px 12px;
+    margin-left: 4px;
+}
+.about-btn:hover {
+    background: #1A0808;
+    border-color: #D63030;
+}
+.about-glyph {
+    font-family: monospace;
+    font-size: 10px;
+    color: #D63030;
+    text-shadow: 0 0 8px rgba(214, 48, 48, 0.7);
+}
+"""
+
+
+if __name__ == '__main__':
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingBarApp()
+    sys.exit(app.run(sys.argv))

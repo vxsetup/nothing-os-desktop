@@ -1,0 +1,157 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 34,
+    "spacing": 0,
+    "margin-top": 8,
+    "margin-left": 10,
+    "margin-right": 10,
+    "fixed-center": true,
+    "ipc": true,
+    "reload_style_on_change": true,
+
+    "modules-left": [
+        "hyprland/workspaces"
+    ],
+
+    "modules-center": [
+        "hyprland/window"
+    ],
+
+    "modules-right": [
+        "custom/recorder",
+        "hyprland/language",
+        "pulseaudio",
+        "bluetooth",
+        "network",
+        "battery",
+        "custom/separator",
+        "clock",
+        "custom/control"
+    ],
+
+    "hyprland/workspaces": {
+        "format": "{id}",
+        "on-click": "activate",
+        "sort-by-number": true,
+        "active-only": false,
+        "all-outputs": false,
+        "disable-scroll": false,
+        "on-scroll-up": "hyprctl dispatch workspace e+1",
+        "on-scroll-down": "hyprctl dispatch workspace e-1"
+    },
+
+    "hyprland/window": {
+        "format": "{title}",
+        "max-length": 42,
+        "separate-outputs": true,
+        "rewrite": {
+            "(.*) [—–-] Mozilla Firefox": "$1",
+            "(.*) [—–-] Google Chrome": "$1",
+            "(.*) [—–-] Chromium": "$1",
+            "(.*) [—–-] Visual Studio Code": "$1",
+            "(.*) [—–-] Telegram": "$1",
+            "(.*) [—–-] Spotify": "$1",
+            "(.*) [—–-] Discord": "$1",
+            "^$": ""
+        }
+    },
+
+    "hyprland/language": {
+        "format": " {}",
+        "format-en": "EN",
+        "format-ru": "RU",
+        "format-uk": "UA",
+        "format-de": "DE",
+        "format-fr": "FR",
+        "on-click": "hyprctl switchxkblayout all next",
+        "tooltip-format": "Keyboard · {long}"
+    },
+
+    "custom/recorder": {
+        "exec": "~/.config/waybar/scripts/recorder-status",
+        "return-type": "json",
+        "interval": 1,
+        "format": "{}",
+        "on-click": "nothing-recorder --toggle-rec",
+        "on-click-right": "nothing-recorder --toggle"
+    },
+
+    "pulseaudio": {
+        "format": " {volume}%",
+        "format-muted": " Muted",
+        "on-click": "nothing-volume --toggle",
+        "on-click-right": "nothing-control --toggle",
+        "on-scroll-up": "nothing-osd --vol-up",
+        "on-scroll-down": "nothing-osd --vol-down",
+        "tooltip-format": "Volume · {volume}%\n{desc}",
+        "scroll-step": 5
+    },
+
+    "bluetooth": {
+        "format": " BT",
+        "format-connected": " BT",
+        "format-disabled": "",
+        "format-off": "",
+        "on-click": "nothing-bluetooth --toggle",
+        "tooltip-format-connected": "{device_alias}"
+    },
+
+    "network": {
+        "format-wifi": " {essid}",
+        "format-ethernet": " ETH",
+        "format-disconnected": " Off",
+        "on-click": "nothing-network --toggle",
+        "tooltip-format-wifi": "{essid} · {signalStrength}%\n{ipaddr}",
+        "tooltip-format-ethernet": "Ethernet · {ipaddr}",
+        "tooltip-format-disconnected": "Disconnected",
+        "max-length": 14,
+        "interval": 10
+    },
+
+    "battery": {
+        "format": "{icon} {capacity}%",
+        "format-charging": " {capacity}%",
+        "format-full": " Full",
+        "format-icons": ["", "", "", "", ""],
+        "states": {
+            "warning": 30,
+            "critical": 15
+        },
+        "tooltip-format": "{capacity}% · {timeTo}\n{power:.1f}W",
+        "interval": 30
+    },
+
+    "custom/separator": {
+        "format": "",
+        "tooltip": false
+    },
+
+    "clock": {
+        "interval": 1,
+        "format": "{:%H:%M}",
+        "format-alt": "{:%a %d %b}",
+        "on-click": "nothing-calendar --toggle",
+        "on-click-right": "nothing-notifications --toggle",
+        "tooltip-format": "<tt><span font_family='JetBrains Mono'>{calendar}</span></tt>",
+        "calendar": {
+            "mode": "month",
+            "weeks-pos": "right",
+            "on-scroll": 1,
+            "format": {
+                "months":   "<span color='#FF2D2D'><b>{}</b></span>",
+                "days":     "<span color='#E0E0E3'>{}</span>",
+                "weeks":    "<span color='#48484A'>W{}</span>",
+                "weekdays": "<span color='#8E8E93'><b>{}</b></span>",
+                "today":    "<span color='#FF2D2D'><b><u>{}</u></b></span>"
+            }
+        }
+    },
+
+    "custom/control": {
+        "format": "●",
+        "on-click": "nothing-control --toggle",
+        "on-click-right": "nothing-about --toggle",
+        "tooltip": false
+    }
+}

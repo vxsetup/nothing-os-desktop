@@ -1,0 +1,1292 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Notifications Center
+Unified with control/volume/osd design language:
+  - red glyph dot in header
+  - hero dot-matrix bell icon with notification count
+  - CircleButton for DND toggle
+  - clean flat notification rows (no thick cards)
+  - dot-matrix counter
+  - inline action pills
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import json
+import math
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+WHITE_04 = (1.0, 1.0, 1.0, 0.04)
+
+STATE_DIR = Path.home() / ".local" / "state" / "nothing-notifications"
+HISTORY_FILE = STATE_DIR / "history.json"
+MAX_HISTORY = 200
+
+
+# ═════════════════════════════════════════════════════════════
+#  Notification source (mako + cached history)
+# ═════════════════════════════════════════════════════════════
+
+
+class NotifSource:
+    @staticmethod
+    def _load_history():
+        if not HISTORY_FILE.exists():
+            return []
+        try:
+            data = json.loads(HISTORY_FILE.read_text())
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _save_history(items):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            HISTORY_FILE.write_text(json.dumps(items[:MAX_HISTORY]))
+        except Exception:
+            pass
+
+    @staticmethod
+    def list():
+        items = NotifSource._load_history()
+        try:
+            r = subprocess.run(
+                ["makoctl", "history"], capture_output=True, text=True, timeout=1
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                data = json.loads(r.stdout)
+                notifs = data.get("data", [[]])[0] if data.get("data") else []
+                fresh = []
+                for n in notifs:
+                    item = NotifSource._convert_mako(n)
+                    if item:
+                        fresh.append(item)
+                fresh_ids = {x["id"] for x in fresh}
+                cache_only = [x for x in items if x.get("id") not in fresh_ids]
+                items = fresh + cache_only
+        except Exception:
+            pass
+        items.sort(key=lambda x: x.get("time", 0), reverse=True)
+        items = items[:MAX_HISTORY]
+        NotifSource._save_history(items)
+        return items
+
+    @staticmethod
+    def _convert_mako(n):
+        try:
+
+            def get(key, default=""):
+                v = n.get(key, {})
+                return v.get("data", default) if isinstance(v, dict) else default
+
+            raw_actions = get("actions", [])
+            actions = []
+            if isinstance(raw_actions, list):
+                i = 0
+                while i < len(raw_actions) - 1:
+                    key = raw_actions[i]
+                    label = raw_actions[i + 1]
+                    if key and label and key != "default":
+                        actions.append({"key": key, "label": label})
+                    i += 2
+            return {
+                "id": int(get("id", 0)) or int(time.time() * 1000),
+                "app": get("app-name", "Unknown"),
+                "summary": get("summary", ""),
+                "body": get("body", ""),
+                "icon": get("app-icon", ""),
+                "urgency": get("urgency", 1),
+                "time": time.time(),
+                "actions": actions,
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def dismiss_one(notif_id):
+        items = [i for i in NotifSource._load_history() if i.get("id") != notif_id]
+        NotifSource._save_history(items)
+        try:
+            r = subprocess.run(
+                ["makoctl", "dismiss", "--id", str(notif_id)],
+                capture_output=True,
+                timeout=1,
+            )
+            if r.returncode != 0:
+                subprocess.run(["makoctl", "dismiss"], capture_output=True, timeout=1)
+        except Exception:
+            pass
+
+    @staticmethod
+    def clear_all():
+        NotifSource._save_history([])
+        try:
+            subprocess.run(
+                ["makoctl", "dismiss", "--all"], capture_output=True, timeout=1
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def invoke_action(notif_id, action_key):
+        try:
+            r = subprocess.run(
+                ["makoctl", "invoke", "--id", str(notif_id), action_key],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if r.returncode != 0:
+                r = subprocess.run(
+                    ["makoctl", "invoke", action_key],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+
+def time_ago(ts):
+    diff = time.time() - ts
+    if diff < 60:
+        return "NOW"
+    if diff < 3600:
+        return f"{int(diff / 60)}M"
+    if diff < 86400:
+        return f"{int(diff / 3600)}H"
+    return f"{int(diff / 86400)}D"
+
+
+def app_id(app):
+    clean = re.sub(r"[^A-Za-z0-9]", "", app or "").upper()
+    return clean[:10] if clean else "APP"
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_bell(cr, cx, cy, active=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE_85)
+    elif active:
+        col = (*RED, 1.0)
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    r = size * 0.30
+    # Bell body
+    cr.move_to(cx - r, cy + r * 0.4)
+    cr.line_to(cx - r * 0.85, cy + r * 0.4)
+    cr.curve_to(
+        cx - r * 0.85, cy - r, cx + r * 0.85, cy - r, cx + r * 0.85, cy + r * 0.4
+    )
+    cr.line_to(cx + r, cy + r * 0.4)
+    cr.stroke()
+    # Clapper
+    cr.arc(cx, cy + r * 0.75, size * 0.07, 0, 2 * math.pi)
+    cr.fill()
+
+
+def _draw_bell_off(cr, cx, cy, active=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE)
+    elif active:
+        col = (*RED, 1.0)
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    r = size * 0.30
+    cr.move_to(cx - r, cy + r * 0.4)
+    cr.line_to(cx - r * 0.85, cy + r * 0.4)
+    cr.curve_to(
+        cx - r * 0.85, cy - r, cx + r * 0.85, cy - r, cx + r * 0.85, cy + r * 0.4
+    )
+    cr.line_to(cx + r, cy + r * 0.4)
+    cr.stroke()
+    cr.arc(cx, cy + r * 0.75, size * 0.07, 0, 2 * math.pi)
+    cr.fill()
+    # Strike-through
+    cr.set_line_width(2.2)
+    cr.move_to(cx - size * 0.42, cy - size * 0.42)
+    cr.line_to(cx + size * 0.42, cy + size * 0.42)
+    cr.stroke()
+
+
+def _draw_trash(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    # Lid
+    cr.move_to(cx - s * 1.05, cy - s * 0.55)
+    cr.line_to(cx + s * 1.05, cy - s * 0.55)
+    cr.stroke()
+    # Handle on lid
+    cr.move_to(cx - s * 0.40, cy - s * 0.55)
+    cr.line_to(cx - s * 0.40, cy - s * 0.85)
+    cr.line_to(cx + s * 0.40, cy - s * 0.85)
+    cr.line_to(cx + s * 0.40, cy - s * 0.55)
+    cr.stroke()
+    # Body
+    cr.move_to(cx - s * 0.85, cy - s * 0.55)
+    cr.line_to(cx - s * 0.70, cy + s * 1.05)
+    cr.line_to(cx + s * 0.70, cy + s * 1.05)
+    cr.line_to(cx + s * 0.85, cy - s * 0.55)
+    cr.stroke()
+    # Lines inside
+    cr.set_line_width(1.6)
+    cr.move_to(cx - s * 0.35, cy - s * 0.20)
+    cr.line_to(cx - s * 0.30, cy + s * 0.75)
+    cr.move_to(cx, cy - s * 0.20)
+    cr.line_to(cx, cy + s * 0.75)
+    cr.move_to(cx + s * 0.35, cy - s * 0.20)
+    cr.line_to(cx + s * 0.30, cy + s * 0.75)
+    cr.stroke()
+
+
+def _draw_close(cr, cx, cy, active=False, size=14, color=None):
+    col = _resolve_color(color, WHITE_50)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(1.8)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.35
+    cr.move_to(cx - s, cy - s)
+    cr.line_to(cx + s, cy + s)
+    cr.move_to(cx + s, cy - s)
+    cr.line_to(cx - s, cy + s)
+    cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton (shared design)
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  StatusDot
+# ═════════════════════════════════════════════════════════════
+
+
+class StatusDot(Gtk.DrawingArea):
+    def __init__(self, size=10):
+        super().__init__()
+        self.active = False
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_active(self, a):
+        self.active = a
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cx, cy = w / 2, h / 2
+        r = min(w, h) / 2 - 1
+        if self.active:
+            cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            cr.set_source_rgba(*WHITE_25)
+            cr.set_line_width(1.0)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  HeroBell — dot-matrix bell with count overlay
+# ═════════════════════════════════════════════════════════════
+
+DOT_FONT = {
+    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+}
+
+
+class HeroBell(Gtk.DrawingArea):
+    """Dot-matrix bell silhouette with count number overlay."""
+
+    BELL = [
+        ".....X.....",
+        "....XXX....",
+        "...X...X...",
+        "..X.....X..",
+        "..X.....X..",
+        ".X.......X.",
+        ".X.......X.",
+        ".X.......X.",
+        "XXXXXXXXXXX",
+        "...........",
+        ".....X.....",
+        "....XXX....",
+        ".....X.....",
+    ]
+
+    def __init__(self, size=130):
+        super().__init__()
+        self.count = 0
+        self.dnd = False
+        self._size = size
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_count(self, n):
+        if n != self.count:
+            self.count = n
+            self.queue_draw()
+
+    def set_dnd(self, on):
+        if on != self.dnd:
+            self.dnd = on
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        rows = len(self.BELL)
+        cols = len(self.BELL[0])
+        cell = min(w, h) / max(rows, cols)
+        dot_r = cell * 0.40
+        offset_x = (w - cols * cell) / 2 + cell / 2
+        offset_y = (h - rows * cell) / 2 + cell / 2
+
+        # Decide colors:
+        # - DND on  → all red (alarm)
+        # - count > 0 → bell white, count badge red
+        # - count == 0 → bell muted white
+        if self.dnd:
+            bell_color = (*RED, 1.0)
+        elif self.count > 0:
+            bell_color = (1, 1, 1, 1)
+        else:
+            bell_color = WHITE_50
+
+        # Draw bell dots
+        for r, row in enumerate(self.BELL):
+            for c, ch in enumerate(row):
+                x = offset_x + c * cell
+                y = offset_y + r * cell
+                if ch == "X":
+                    cr.set_source_rgba(*bell_color)
+                    cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                else:
+                    cr.set_source_rgba(*WHITE_06)
+                    cr.arc(x, y, dot_r * 0.4, 0, 2 * math.pi)
+                cr.fill()
+
+        # Count badge — top-right corner, dot-matrix
+        if self.count > 0 and not self.dnd:
+            self._draw_badge(cr, w, h)
+
+    def _draw_badge(self, cr, w, h):
+        # Show '99+' if more than 99
+        text = "99+" if self.count > 99 else str(self.count)
+        chars = list(text)
+        # Small cell for badge
+        cell = max(3, int(self._size * 0.038))
+        char_w = 5 * cell if text != "99+" else 4 * cell  # narrower for +
+        gap = cell * 0.5
+
+        # Calculate badge size
+        total_w = 0
+        for i, ch in enumerate(chars):
+            cw = 5 * cell if ch != "+" else 3 * cell
+            total_w += cw
+            if i < len(chars) - 1:
+                total_w += gap
+
+        badge_h = 7 * cell
+        pad = cell * 1.6
+        badge_w = total_w + pad * 2
+        badge_h_full = badge_h + pad * 2
+
+        # Position: top-right
+        bx = w - badge_w - 4
+        by = 4
+
+        # Red badge background
+        round_rect(cr, bx, by, badge_w, badge_h_full, badge_h_full / 2)
+        cr.set_source_rgb(*RED)
+        cr.fill()
+
+        # Draw text in badge (mini dot-matrix or solid for +)
+        x_cursor = bx + pad
+        y_offset = by + pad
+        dot_r = cell * 0.42
+        for ch in chars:
+            if ch == "+":
+                # Solid plus glyph (centered in cell)
+                cx_plus = x_cursor + (3 * cell) / 2
+                cy_plus = y_offset + (7 * cell) / 2
+                arm = cell * 1.4
+                thick = cell * 0.5
+                # Horizontal
+                round_rect(
+                    cr, cx_plus - arm, cy_plus - thick / 2, arm * 2, thick, thick / 2
+                )
+                cr.set_source_rgb(1, 1, 1)
+                cr.fill()
+                # Vertical
+                round_rect(
+                    cr, cx_plus - thick / 2, cy_plus - arm, thick, arm * 2, thick / 2
+                )
+                cr.set_source_rgb(1, 1, 1)
+                cr.fill()
+                x_cursor += 3 * cell + gap
+                continue
+
+            glyph = DOT_FONT.get(ch, DOT_FONT[" "])
+            for r in range(7):
+                for c in range(5):
+                    px = x_cursor + c * cell + cell / 2
+                    py = y_offset + r * cell + cell / 2
+                    if glyph[r][c] == "1":
+                        cr.set_source_rgb(1, 1, 1)
+                        cr.arc(px, py, dot_r, 0, 2 * math.pi)
+                        cr.fill()
+            x_cursor += 5 * cell + gap
+
+
+# ═════════════════════════════════════════════════════════════
+#  Notification row — flat, no thick card
+# ═════════════════════════════════════════════════════════════
+
+
+class NotifRow(Gtk.Box):
+    def __init__(self, notif, on_dismiss, on_action):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add_css_class("notif-row")
+        self.notif = notif
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        top.set_margin_top(12)
+        top.set_margin_start(16)
+        top.set_margin_end(12)
+        top.set_margin_bottom(8 if notif.get("actions") else 12)
+
+        # Urgency dot
+        dot = StatusDot(size=8)
+        dot.set_valign(Gtk.Align.START)
+        dot.set_margin_top(6)
+        dot.set_active(notif.get("urgency", 1) >= 2)
+        top.append(dot)
+
+        # Info column
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        # Meta row — app id + time
+        meta_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        app_lbl = Gtk.Label(label=app_id(notif.get("app", "")), xalign=0)
+        app_lbl.add_css_class("notif-app")
+        meta_row.append(app_lbl)
+        sep = Gtk.Label(label="·", xalign=0)
+        sep.add_css_class("notif-sep")
+        meta_row.append(sep)
+        time_lbl = Gtk.Label(label=time_ago(notif.get("time", 0)), xalign=0)
+        time_lbl.add_css_class("notif-time")
+        meta_row.append(time_lbl)
+        info.append(meta_row)
+
+        # Summary (title)
+        summary = notif.get("summary", "") or "(no title)"
+        name_lbl = Gtk.Label(label=summary, xalign=0)
+        name_lbl.add_css_class("notif-title")
+        name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        name_lbl.set_max_width_chars(38)
+        info.append(name_lbl)
+
+        # Body
+        body = (notif.get("body", "") or "").strip()
+        if body:
+            body_lbl = Gtk.Label(label=body, xalign=0)
+            body_lbl.add_css_class("notif-body")
+            body_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            body_lbl.set_max_width_chars(40)
+            body_lbl.set_wrap(True)
+            body_lbl.set_lines(2)
+            info.append(body_lbl)
+
+        top.append(info)
+
+        # Dismiss circular button (24px small)
+        dismiss = CircleButton(_draw_close, size=24, toggle=False)
+        dismiss.set_valign(Gtk.Align.START)
+        dismiss.set_margin_top(2)
+        dismiss.connect("clicked", lambda _c: on_dismiss(notif))
+        top.append(dismiss)
+
+        self.append(top)
+
+        # Action pills
+        actions = notif.get("actions", [])
+        if actions:
+            actions_wrap = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            actions_wrap.set_margin_start(38)
+            actions_wrap.set_margin_end(16)
+            actions_wrap.set_margin_bottom(12)
+            for i, action in enumerate(actions[:4]):
+                btn = Gtk.Button(label=action["label"].upper())
+                if i == 0:
+                    btn.add_css_class("action-pill-accent")
+                else:
+                    btn.add_css_class("action-pill")
+                btn.connect("clicked", lambda b, k=action["key"]: on_action(notif, k))
+                actions_wrap.append(btn)
+            self.append(actions_wrap)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingNotifWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._refresh_pending = False
+        self._dnd_on = False
+
+        self.set_title("nothing-notifications")
+        self.set_default_size(400, 760)
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-notifications")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 12)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, 12)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="NOTIFICATIONS", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+        self.count_lbl = Gtk.Label(label="0")
+        self.count_lbl.add_css_class("header-meta")
+        header.append(self.count_lbl)
+        card.append(header)
+
+        # ─── Hero ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(22)
+        hero.set_margin_bottom(10)
+        self.hero = HeroBell(size=140)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+        self.hero_status = Gtk.Label(label="ALL CLEAR")
+        self.hero_status.add_css_class("hero-date")
+        hero.append(self.hero_status)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(20)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── Quick actions: DND + CLEAR (two circular buttons) ───
+        actions_hdr = self._mk_section_hdr("ACTIONS")
+        card.append(actions_hdr)
+
+        act_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        act_row.set_margin_start(20)
+        act_row.set_margin_end(20)
+        act_row.set_margin_top(4)
+        act_row.set_homogeneous(True)
+
+        # DND labeled circle
+        dnd_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        dnd_wrap.set_halign(Gtk.Align.CENTER)
+        self.dnd_btn = CircleButton(_draw_bell_off, size=56, toggle=False)
+        self.dnd_btn.connect("clicked", lambda _c: self._on_dnd())
+        dnd_wrap.append(self.dnd_btn)
+        self.dnd_label = Gtk.Label(label="DND")
+        self.dnd_label.add_css_class("tile-label")
+        dnd_wrap.append(self.dnd_label)
+        act_row.append(dnd_wrap)
+
+        # Clear all
+        clear_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        clear_wrap.set_halign(Gtk.Align.CENTER)
+        self.clear_btn = CircleButton(_draw_trash, size=56, toggle=False)
+        self.clear_btn.connect("clicked", lambda _c: self._on_clear())
+        clear_wrap.append(self.clear_btn)
+        clear_label = Gtk.Label(label="CLEAR ALL")
+        clear_label.add_css_class("tile-label")
+        clear_wrap.append(clear_label)
+        act_row.append(clear_wrap)
+
+        card.append(act_row)
+
+        # ─── History ───
+        hist_hdr = self._mk_section_hdr("HISTORY")
+        card.append(hist_hdr)
+
+        self.list_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.list_wrap.set_margin_start(20)
+        self.list_wrap.set_margin_end(20)
+        self.list_wrap.set_margin_top(4)
+        card.append(self.list_wrap)
+
+        self.empty_lbl = Gtk.Label(label="NO NOTIFICATIONS")
+        self.empty_lbl.add_css_class("empty-label-clean")
+        self.empty_lbl.set_margin_top(32)
+        self.empty_lbl.set_margin_bottom(32)
+        self.list_wrap.append(self.empty_lbl)
+
+        bottom = Gtk.Box()
+        bottom.set_size_request(-1, 28)
+        card.append(bottom)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        self._kick_refresh()
+        GLib.timeout_add(2000, self._auto_refresh)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_section_hdr(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(12)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def worker():
+            try:
+                items = NotifSource.list()
+                dnd_on = False
+                try:
+                    r = subprocess.run(
+                        ["makoctl", "mode"], capture_output=True, text=True, timeout=1
+                    )
+                    dnd_on = "do-not-disturb" in r.stdout
+                except Exception:
+                    pass
+            except Exception:
+                items = []
+                dnd_on = False
+            GLib.idle_add(self._apply, items, dnd_on)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, items, dnd_on):
+        self._refresh_pending = False
+        n = len(items)
+        self.count_lbl.set_text(str(n))
+        self.hero.set_count(n)
+        self.hero.set_dnd(dnd_on)
+        self._dnd_on = dnd_on
+        self.dnd_btn.set_active(dnd_on)
+
+        if dnd_on:
+            self.hero_status.set_text("DO NOT DISTURB")
+            self.dnd_label.add_css_class("tile-label-active")
+        else:
+            self.hero_status.set_text(f"{n} PENDING" if n > 0 else "ALL CLEAR")
+            self.dnd_label.remove_css_class("tile-label-active")
+
+        # Repopulate list
+        while child := self.list_wrap.get_first_child():
+            self.list_wrap.remove(child)
+
+        if not items:
+            self.empty_lbl.set_visible(True)
+            self.list_wrap.append(self.empty_lbl)
+        else:
+            self.empty_lbl.set_visible(False)
+            for i, n_item in enumerate(items):
+                row = NotifRow(n_item, self._on_dismiss, self._on_action)
+                self.list_wrap.append(row)
+                if i < len(items) - 1:
+                    div = Gtk.Box()
+                    div.add_css_class("row-divider-inline")
+                    div.set_margin_start(16)
+                    div.set_margin_end(16)
+                    div.set_size_request(-1, 1)
+                    self.list_wrap.append(div)
+        return False
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    def _on_dismiss(self, notif):
+        def worker():
+            NotifSource.dismiss_one(notif.get("id"))
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_action(self, notif, action_key):
+        def worker():
+            ok = NotifSource.invoke_action(notif.get("id"), action_key)
+            if ok:
+                NotifSource.dismiss_one(notif.get("id"))
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_clear(self):
+        def worker():
+            NotifSource.clear_all()
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_dnd(self):
+        def worker():
+            try:
+                r = subprocess.run(
+                    ["makoctl", "mode"], capture_output=True, text=True, timeout=1
+                )
+                on = "do-not-disturb" in r.stdout
+                if on:
+                    subprocess.run(["makoctl", "mode", "-r", "do-not-disturb"])
+                else:
+                    subprocess.run(["makoctl", "mode", "-a", "do-not-disturb"])
+            except Exception:
+                pass
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-notifications")
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingNotifApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.55);
+        letter-spacing: 2.5px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .tile-label {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.70);
+        letter-spacing: 1.5px;
+    }
+    .tile-label-active {
+        color: #FF2D2D;
+        font-weight: 700;
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+
+    /* Notification row — flat, no card */
+    .notif-row {
+        background: transparent;
+        border: none;
+        border-radius: 0;
+    }
+    .notif-row:hover {
+        background-color: rgba(255, 255, 255, 0.02);
+        border-radius: 10px;
+    }
+
+    /* Notification text */
+    .notif-app {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.55);
+        letter-spacing: 1.5px;
+    }
+    .notif-sep {
+        font-family: "JetBrains Mono", monospace;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.20);
+    }
+    .notif-time {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.30);
+        letter-spacing: 1px;
+    }
+    .notif-title {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+        margin-top: 2px;
+    }
+    .notif-body {
+        font-family: "Inter", sans-serif;
+        font-weight: 400;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.55);
+        margin-top: 2px;
+    }
+
+    /* Action pills */
+    .action-pill, .action-pill-accent {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        letter-spacing: 1.5px;
+        padding: 6px 14px;
+        border-radius: 14px;
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .action-pill {
+        background-color: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .action-pill:hover {
+        background-color: rgba(255, 255, 255, 0.10);
+        color: #FFFFFF;
+        border-color: rgba(255, 255, 255, 0.16);
+    }
+    .action-pill-accent {
+        background-color: rgba(255, 45, 45, 0.10);
+        color: #FF2D2D;
+        border: 1px solid rgba(255, 45, 45, 0.30);
+    }
+    .action-pill-accent:hover {
+        background-color: #FF2D2D;
+        color: #FFFFFF;
+        border-color: #FF2D2D;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.notifications",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("clear", "c", "Clear all"),
+            ("dnd", "D", "Toggle DND"),
+            ("daemon", "d", "Run as daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingNotifWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if "quit" in opts:
+            self.quit()
+            return 0
+        if "clear" in opts:
+            NotifSource.clear_all()
+            return 0
+        if "dnd" in opts:
+            try:
+                r = subprocess.run(
+                    ["makoctl", "mode"], capture_output=True, text=True, timeout=1
+                )
+                if "do-not-disturb" in r.stdout:
+                    subprocess.run(["makoctl", "mode", "-r", "do-not-disturb"])
+                else:
+                    subprocess.run(["makoctl", "mode", "-a", "do-not-disturb"])
+            except Exception:
+                pass
+            return 0
+        if "hide" in opts:
+            self.window.hide_popup()
+        elif "toggle" in opts:
+            self.window.toggle_popup()
+        elif "show" in opts:
+            self.window.show_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingNotifApp()
+    sys.exit(app.run(sys.argv))

@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Workspace Switcher Overlay
+Debug version with verbose logging.
+"""
+
+import os
+import sys
+import json
+import subprocess
+import math
+import time
+import traceback
+from pathlib import Path
+
+
+def log(msg):
+    print(f"[ws] {msg}", file=sys.stderr, flush=True)
+
+
+def _preload():
+    paths = [
+        '/usr/lib/libgtk4-layer-shell.so.0',
+        '/usr/lib/libgtk4-layer-shell.so',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so',
+        '/usr/lib64/libgtk4-layer-shell.so.0',
+        '/usr/lib64/libgtk4-layer-shell.so',
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            if p not in os.environ.get('LD_PRELOAD', ''):
+                os.environ['LD_PRELOAD'] = p
+                log(f"preloading {p}")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            else:
+                log(f"already preloaded {p}")
+            return
+    log("WARNING: no gtk4-layer-shell library found! Install gtk4-layer-shell package")
+
+
+_preload()
+
+import gi
+gi.require_version('Gtk', '4.0')
+
+try:
+    gi.require_version('Gtk4LayerShell', '1.0')
+    from gi.repository import Gtk4LayerShell as LS
+    HAS_LS = True
+    log("Gtk4LayerShell available")
+except (ValueError, ImportError) as e:
+    log(f"Gtk4LayerShell NOT available: {e}")
+    HAS_LS = False
+
+from gi.repository import Gtk, GLib, Gdk, Gio, GObject
+import cairo
+
+
+# ═══════════════════════════════════════════════════════════
+#  Palette
+# ═══════════════════════════════════════════════════════════
+
+RED       = (1.000, 0.176, 0.176)
+WHITE     = (1.0, 1.0, 1.0, 1.0)
+WHITE_85  = (1, 1, 1, 0.85)
+WHITE_50  = (1, 1, 1, 0.50)
+WHITE_25  = (1, 1, 1, 0.25)
+WHITE_12  = (1, 1, 1, 0.12)
+WHITE_08  = (1, 1, 1, 0.08)
+WHITE_06  = (1, 1, 1, 0.06)
+
+
+def _run(cmd, timeout=2):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           check=False, timeout=timeout)
+        if r.returncode != 0:
+            log(f"cmd failed: {' '.join(cmd)} → rc={r.returncode}, "
+                f"stderr={r.stderr[:200]}")
+        return r.stdout
+    except Exception as e:
+        log(f"cmd exception: {' '.join(cmd)} → {e}")
+        return ""
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Hyprland IPC
+# ═══════════════════════════════════════════════════════════
+
+def get_workspaces():
+    log("fetching hyprctl data...")
+    try:
+        ws_json = _run(['hyprctl', 'workspaces', '-j'])
+        clients_json = _run(['hyprctl', 'clients', '-j'])
+        active_json = _run(['hyprctl', 'activeworkspace', '-j'])
+        monitors_json = _run(['hyprctl', 'monitors', '-j'])
+
+        workspaces = json.loads(ws_json) if ws_json.strip() else []
+        clients = json.loads(clients_json) if clients_json.strip() else []
+        active = json.loads(active_json) if active_json.strip() else {}
+        monitors = json.loads(monitors_json) if monitors_json.strip() else []
+
+        log(f"workspaces: {len(workspaces)}, clients: {len(clients)}, "
+            f"monitors: {len(monitors)}")
+
+        # Index clients by workspace ID
+        windows_by_ws = {}
+        for c in clients:
+            ws_id = c.get('workspace', {}).get('id')
+            if ws_id is None:
+                continue
+            if c.get('hidden') or not c.get('mapped'):
+                continue
+            windows_by_ws.setdefault(ws_id, []).append({
+                'title': c.get('title', '')[:40],
+                'class': c.get('class', ''),
+                'at': c.get('at', [0, 0]),
+                'size': c.get('size', [100, 100]),
+                'focused': c.get('focusHistoryID', -1) == 0,
+            })
+
+        # Monitor geometry
+        if monitors:
+            focused_mon = next((m for m in monitors if m.get('focused')),
+                               monitors[0])
+            mon_w = focused_mon.get('width', 1920)
+            mon_h = focused_mon.get('height', 1080)
+        else:
+            mon_w, mon_h = 1920, 1080
+
+        # Build workspace list
+        ws_map = {ws['id']: ws for ws in workspaces}
+        active_id = active.get('id', 1)
+
+        # Always show 1..5 + any extra workspaces with content
+        ws_ids = set(range(1, 6))
+        for ws in workspaces:
+            if ws['id'] > 0:
+                ws_ids.add(ws['id'])
+        for wid in windows_by_ws.keys():
+            if wid > 0:
+                ws_ids.add(wid)
+        ws_ids = sorted(ws_ids)
+        log(f"will show ws_ids: {ws_ids}, active: {active_id}")
+
+        result = []
+        for ws_id in ws_ids:
+            ws = ws_map.get(ws_id, {})
+            wins = windows_by_ws.get(ws_id, [])
+            result.append({
+                'id': ws_id,
+                'name': ws.get('name', str(ws_id)),
+                'windows': wins,
+                'active': ws_id == active_id,
+                'mon_w': mon_w,
+                'mon_h': mon_h,
+            })
+
+        return result, active_id
+    except Exception as e:
+        log(f"get_workspaces error: {e}\n{traceback.format_exc()}")
+        return [], 1
+
+
+def switch_to_workspace(ws_id):
+    log(f"switching to workspace {ws_id}")
+    subprocess.run(['hyprctl', 'dispatch', 'workspace', str(ws_id)])
+
+
+# ═══════════════════════════════════════════════════════════
+#  Workspace Tile widget
+# ═══════════════════════════════════════════════════════════
+
+class WorkspaceTile(Gtk.DrawingArea):
+    __gsignals__ = {
+        'activated': (GObject.SignalFlags.RUN_LAST, None, (int,)),
+    }
+
+    def __init__(self, workspace_data, target_w=240, target_h=140):
+        super().__init__()
+        self.data = workspace_data
+        self._hover = False
+        self._press = False
+        self.set_content_width(target_w)
+        self.set_content_height(target_h)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect('pressed', self._on_press)
+        click.connect('released', self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect('enter', self._on_enter)
+        hover.connect('leave', self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        self.queue_draw()
+        if was_press:
+            self.emit('activated', self.data['id'])
+
+    def _draw(self, area, cr, w, h):
+        active = self.data['active']
+        radius = 14
+
+        round_rect(cr, 0, 0, w, h, radius)
+        if active:
+            cr.set_source_rgba(RED[0], RED[1], RED[2], 0.10)
+        elif self._press:
+            cr.set_source_rgba(*WHITE_12)
+        elif self._hover:
+            cr.set_source_rgba(*WHITE_08)
+        else:
+            cr.set_source_rgba(*WHITE_06)
+        cr.fill()
+
+        round_rect(cr, 0.5, 0.5, w - 1, h - 1, radius)
+        cr.set_line_width(1)
+        if active:
+            cr.set_source_rgba(RED[0], RED[1], RED[2], 0.55)
+        elif self._hover:
+            cr.set_source_rgba(*WHITE_25)
+        else:
+            cr.set_source_rgba(*WHITE_08)
+        cr.stroke()
+
+        cr.select_font_face('JetBrains Mono', cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(11)
+        ws_label = f"WS {self.data['name']}"
+        if active:
+            cr.set_source_rgb(*RED)
+        else:
+            cr.set_source_rgba(*WHITE_50)
+        cr.move_to(14, 22)
+        cr.show_text(ws_label)
+
+        wins = self.data['windows']
+        if wins:
+            count_text = f"{len(wins)}"
+            cr.set_source_rgba(*WHITE_85)
+            ext = cr.text_extents(count_text)
+            cr.move_to(w - 14 - ext.width, 22)
+            cr.show_text(count_text)
+
+        if wins:
+            self._draw_windows(cr, w, h, wins)
+        else:
+            cr.set_source_rgba(*WHITE_25)
+            cr.set_font_size(10)
+            text = 'EMPTY'
+            ext = cr.text_extents(text)
+            cr.move_to((w - ext.width) / 2, h / 2 + 4)
+            cr.show_text(text)
+
+    def _draw_windows(self, cr, w, h, windows):
+        mon_w = self.data['mon_w']
+        mon_h = self.data['mon_h']
+        if mon_w <= 0 or mon_h <= 0:
+            return
+
+        pad = 12
+        top = 32
+        canvas_x = pad
+        canvas_y = top
+        canvas_w = w - pad * 2
+        canvas_h = h - top - pad
+
+        scale_x = canvas_w / mon_w
+        scale_y = canvas_h / mon_h
+
+        for win in windows:
+            wx, wy = win['at']
+            ww, wh = win['size']
+
+            wx_local = max(0, wx)
+            wy_local = max(0, wy)
+
+            mx = canvas_x + wx_local * scale_x
+            my = canvas_y + wy_local * scale_y
+            mw = max(8, ww * scale_x)
+            mh = max(6, wh * scale_y)
+
+            if mx + mw > canvas_x + canvas_w:
+                mw = canvas_x + canvas_w - mx
+            if my + mh > canvas_y + canvas_h:
+                mh = canvas_y + canvas_h - my
+            if mw < 4 or mh < 4:
+                continue
+
+            round_rect(cr, mx, my, mw, mh, 2)
+            if win['focused']:
+                cr.set_source_rgba(1, 1, 1, 0.20)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.10)
+            cr.fill()
+
+            round_rect(cr, mx + 0.5, my + 0.5, mw - 1, mh - 1, 2)
+            cr.set_line_width(0.5)
+            if win['focused']:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+                cr.set_line_width(1.0)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.20)
+            cr.stroke()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Switcher Window
+# ═══════════════════════════════════════════════════════════
+
+class SwitcherWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        log("creating switcher window")
+        self.set_decorated(False)
+        self.set_default_size(1280, 720)  # fallback size
+        self.add_css_class('switcher-bg')
+
+        if HAS_LS:
+            log("setting up layer shell")
+            LS.init_for_window(self)
+            LS.set_namespace(self, 'nothing-workspaces')
+            LS.set_layer(self, LS.Layer.OVERLAY)
+            LS.set_anchor(self, LS.Edge.TOP, True)
+            LS.set_anchor(self, LS.Edge.BOTTOM, True)
+            LS.set_anchor(self, LS.Edge.LEFT, True)
+            LS.set_anchor(self, LS.Edge.RIGHT, True)
+            LS.set_exclusive_zone(self, -1)
+            LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
+        else:
+            log("layer shell NOT available, using regular window")
+            self.set_default_size(1280, 720)
+            self.fullscreen()
+
+        workspaces, active_id = get_workspaces()
+        log(f"got {len(workspaces)} workspaces")
+        self.active_id = active_id
+        self.tiles = []
+
+        # Outermost — fills layer-shell window
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.set_hexpand(True)
+        outer.set_vexpand(True)
+        outer.set_halign(Gtk.Align.FILL)
+        outer.set_valign(Gtk.Align.FILL)
+
+        # Centered content
+        content_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content_wrap.set_hexpand(True)
+        content_wrap.set_vexpand(True)
+        content_wrap.set_halign(Gtk.Align.CENTER)
+        content_wrap.set_valign(Gtk.Align.CENTER)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_halign(Gtk.Align.CENTER)
+        header.set_margin_bottom(28)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label='WORKSPACES')
+        title.add_css_class('switcher-title')
+        header.append(title)
+
+        count = Gtk.Label(label=f'{len(workspaces)}')
+        count.add_css_class('switcher-count')
+        header.append(count)
+
+        root.append(header)
+
+        # Grid
+        grid = Gtk.Grid()
+        grid.set_row_spacing(14)
+        grid.set_column_spacing(14)
+        grid.set_halign(Gtk.Align.CENTER)
+
+        cols = 5
+        for i, ws in enumerate(workspaces):
+            tile = WorkspaceTile(ws, target_w=240, target_h=140)
+            tile.connect('activated', self._on_tile_activated)
+            self.tiles.append(tile)
+            grid.attach(tile, i % cols, i // cols, 1, 1)
+            log(f"  added tile for ws {ws['id']}")
+
+        root.append(grid)
+
+        hint = Gtk.Label(label='CLICK · NUMBER KEYS · ESC TO CLOSE')
+        hint.add_css_class('switcher-hint')
+        hint.set_halign(Gtk.Align.CENTER)
+        hint.set_margin_top(28)
+        root.append(hint)
+
+        content_wrap.append(root)
+        outer.append(content_wrap)
+        self.set_child(outer)
+
+        # Keyboard
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect('key-pressed', self._on_key)
+        self.add_controller(ctrl)
+
+        log("switcher window setup done")
+
+    def _on_tile_activated(self, _tile, ws_id):
+        log(f"tile activated: {ws_id}")
+        switch_to_workspace(ws_id)
+        self.close()
+
+    def _on_key(self, c, keyval, keycode, state):
+        log(f"key: {keyval}")
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        if Gdk.KEY_1 <= keyval <= Gdk.KEY_9:
+            ws = keyval - Gdk.KEY_0
+            switch_to_workspace(ws)
+            self.close()
+            return True
+        if keyval == Gdk.KEY_0:
+            switch_to_workspace(10)
+            self.close()
+            return True
+        if keyval == Gdk.KEY_Tab:
+            self.close()
+            return True
+        return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  Application
+# ═══════════════════════════════════════════════════════════
+
+CSS = """
+window.switcher-bg {
+    background-color: rgba(11, 11, 12, 0.88);
+}
+.switcher-title {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 700;
+    font-size: 14px;
+    color: #F7F7F7;
+    letter-spacing: 4px;
+}
+.switcher-count {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 600;
+    font-size: 12px;
+    color: #FF2D2D;
+    letter-spacing: 2px;
+}
+.switcher-hint {
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 600;
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.30);
+    letter-spacing: 3px;
+}
+"""
+
+
+class SwitcherApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id='tech.nothing.workspaces')
+        self.window = None
+
+    def do_startup(self):
+        log("app startup")
+        Gtk.Application.do_startup(self)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS.encode())
+        display = Gdk.Display.get_default()
+        if display:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            log("CSS loaded")
+        else:
+            log("WARNING: no display!")
+
+    def do_activate(self):
+        log("app activate")
+        if self.window is None:
+            self.window = SwitcherWindow(self)
+        self.window.present()
+        log("window presented")
+
+
+def main():
+    log("=== nothing-workspaces start ===")
+    log(f"display: {os.environ.get('WAYLAND_DISPLAY', 'NOT SET')}")
+    log(f"session type: {os.environ.get('XDG_SESSION_TYPE', 'NOT SET')}")
+
+    app = SwitcherApp()
+    rc = app.run([])
+    log(f"app exit: {rc}")
+    sys.exit(rc)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        log(f"FATAL: {e}\n{traceback.format_exc()}")
+        sys.exit(1)

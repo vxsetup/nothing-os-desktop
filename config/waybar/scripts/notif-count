@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+count=0
+if command -v makoctl >/dev/null 2>&1; then
+    count=$(makoctl history 2>/dev/null | grep -c '"summary"' || echo 0)
+fi
+
+if [ "$count" -gt 0 ]; then
+    echo "{\"text\":\"${count}\",\"class\":\"has-notifications\",\"tooltip\":\"${count} pending\"}"
+else
+    echo '{"text":"","class":"empty","tooltip":"All clear"}'
+fi

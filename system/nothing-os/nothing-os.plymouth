@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Nothing OS
+Description=Nothing OS dot-matrix boot animation
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/nothing-os
+ScriptFile=/usr/share/plymouth/themes/nothing-os/nothing-os.script

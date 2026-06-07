@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════════
+#  Nothing OS Desktop — gitignore
+# ═══════════════════════════════════════════════════════════
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.sublime-*
+
+# OS
+.cache/
+.local/
+
+# Build artifacts
+build/
+dist/
+*.tar.gz
+*.zip
+
+# User data (never commit)
+state.json
+widgets.json
+notes.json
+usage.json
+history.json
+
+# Generated wallpapers (user-specific)
+wallpapers/output/
+
+# Plymouth generated assets (regenerated on install)
+system/plymouth/nothing-os/*.png
+
+# Test/dev
+test/
+sandbox/
+notes.md
+TODO.md
+
+# Backups created by install.sh
+.config-backup-*/
+
+# NDot font (IP — never commit)
+fonts/*.otf
+fonts/*.ttf
+!fonts/README.md
+
+# Fish runtime files (per-user state)
+config/fish/fish_variables
+config/fish/fishd.*
+config/fish/completions/
+config/fish/generated_completions/

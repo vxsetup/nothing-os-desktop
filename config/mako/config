@@ -1,0 +1,80 @@
+# ═══════════════════════════════════════════════════════════
+#  Mako — Nothing OS notification styling
+# ═══════════════════════════════════════════════════════════
+
+font=Inter 11
+background-color=#141416E6
+text-color=#F7F7F7
+border-color=#FFFFFF14
+border-size=1
+border-radius=14
+padding=14
+margin=10
+default-timeout=4000
+
+# Position: top right (like Nothing notification shade)
+anchor=top-right
+layer=overlay
+width=380
+height=120
+max-icon-size=42
+icon-location=left
+
+# History
+max-visible=5
+sort=-time
+
+sort=-time
+layer=overlay
+anchor=top-right
+
+[app-name=nothing-screenshot]
+default-timeout=5000
+ignore-timeout=0
+invisible=0
+border-color=#FF2D2D80
+border-size=2
+
+# ─── Per-urgency styling ───────────────────────────────────
+
+[urgency=low]
+background-color=#141416CC
+text-color=#C8C8CC
+border-color=#FFFFFF0F
+default-timeout=2500
+
+[urgency=normal]
+background-color=#141416E6
+text-color=#F7F7F7
+border-color=#FFFFFF14
+default-timeout=4000
+
+[urgency=critical]
+background-color=#141416F2
+text-color=#F7F7F7
+border-color=#FF2D2D80
+border-size=2
+default-timeout=8000
+
+# ─── Per-app overrides ─────────────────────────────────────
+
+[app-name=nothing-screenshot]
+border-color=#FF2D2D40
+default-timeout=5000
+
+[app-name=nothing-recorder]
+border-color=#FF2D2D40
+
+[app-name=nothing-volume]
+default-timeout=1500
+group-by=app-name
+
+[app-name=nothing-network]
+border-color=#FF2D2D40
+
+[app-name=nothing-bluetooth]
+border-color=#FF2D2D40
+
+[app-name=nothing-control]
+default-timeout=1500
+group-by=app-name

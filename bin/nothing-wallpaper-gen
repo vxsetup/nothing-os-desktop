@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Wallpaper Generator
+Creates dot-matrix generative wallpapers in Nothing style.
+"""
+
+import cairo
+import math
+import random
+import os
+from pathlib import Path
+
+OUTPUT_DIR = Path.home() / 'Pictures' / 'NothingWallpapers'
+W, H = 2560, 1440
+
+RED = (1.0, 0.176, 0.176)
+BG  = (0.043, 0.043, 0.047)
+
+
+def make_surface():
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+    cr = cairo.Context(surface)
+    cr.set_source_rgb(*BG)
+    cr.paint()
+    return surface, cr
+
+
+def draw_perforation(cr, cell=18, dot_r=1.2, alpha=0.04):
+    """Base perforation grid — Nothing signature."""
+    cols = int(W / cell) + 1
+    rows = int(H / cell) + 1
+    cr.set_source_rgba(1, 1, 1, alpha)
+    for r in range(rows):
+        for c in range(cols):
+            x = c * cell + cell / 2
+            y = r * cell + cell / 2
+            cr.arc(x, y, dot_r, 0, 2 * math.pi)
+            cr.fill()
+
+
+def draw_nothing_logo(cr, cx, cy, size=300, alpha=0.08):
+    """Nothing ⦿ logo — outer ring + center dot."""
+    # Outer ring
+    cr.set_source_rgba(1, 1, 1, alpha)
+    cr.set_line_width(size * 0.06)
+    cr.arc(cx, cy, size * 0.45, 0, 2 * math.pi)
+    cr.stroke()
+    # Center dot
+    cr.arc(cx, cy, size * 0.12, 0, 2 * math.pi)
+    cr.fill()
+
+
+def draw_dot_matrix_text(cr, text, cx, cy, cell=12, alpha=0.12):
+    """Render text as dot-matrix glyphs centered at cx, cy."""
+    DOT_FONT = {
+        'N': ["10001","11001","10101","10011","10001"],
+        'O': ["01110","10001","10001","10001","01110"],
+        'T': ["11111","00100","00100","00100","00100"],
+        'H': ["10001","10001","11111","10001","10001"],
+        'I': ["01110","00100","00100","00100","01110"],
+        'G': ["01110","10000","10111","10001","01110"],
+        ' ': ["00000","00000","00000","00000","00000"],
+    }
+    chars = list(text.upper())
+    char_w = 5 * cell
+    gap = cell
+    total_w = len(chars) * char_w + (len(chars) - 1) * gap
+    start_x = cx - total_w / 2
+    start_y = cy - 2.5 * cell
+    dot_r = cell * 0.35
+
+    for ci, ch in enumerate(chars):
+        glyph = DOT_FONT.get(ch, DOT_FONT[' '])
+        gx = start_x + ci * (char_w + gap)
+        for r in range(5):
+            for c in range(5):
+                x = gx + c * cell + cell / 2
+                y = start_y + r * cell + cell / 2
+                on = r < len(glyph) and c < len(glyph[r]) and \
+                     glyph[r][c] == '1'
+                if on:
+                    cr.set_source_rgba(1, 1, 1, alpha)
+                    cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                    cr.fill()
+
+
+def draw_accent_dots(cr, count=40, min_r=2, max_r=6):
+    """Scattered red accent dots — sparse, like glyph LEDs."""
+    for _ in range(count):
+        x = random.randint(100, W - 100)
+        y = random.randint(100, H - 100)
+        r = random.uniform(min_r, max_r)
+        alpha = random.uniform(0.05, 0.20)
+        cr.set_source_rgba(*RED, alpha)
+        cr.arc(x, y, r, 0, 2 * math.pi)
+        cr.fill()
+
+
+def draw_concentric_rings(cr, cx, cy, count=8, spacing=60,
+                           dot_r=1.5, alpha=0.06):
+    """Concentric dot rings — like WiFi hero in popup."""
+    for i in range(count):
+        ring_r = (i + 1) * spacing
+        dots = int(ring_r * 0.15)
+        for j in range(dots):
+            a = (j / dots) * 2 * math.pi
+            x = cx + math.cos(a) * ring_r
+            y = cy + math.sin(a) * ring_r
+            cr.set_source_rgba(1, 1, 1, alpha * (1 - i / count * 0.7))
+            cr.arc(x, y, dot_r, 0, 2 * math.pi)
+            cr.fill()
+
+
+def draw_grid_lines(cr, spacing=120, alpha=0.025):
+    """Subtle grid lines — industrial feel."""
+    cr.set_source_rgba(1, 1, 1, alpha)
+    cr.set_line_width(0.5)
+    for x in range(0, W, spacing):
+        cr.move_to(x, 0)
+        cr.line_to(x, H)
+        cr.stroke()
+    for y in range(0, H, spacing):
+        cr.move_to(0, y)
+        cr.line_to(W, y)
+        cr.stroke()
+
+
+def draw_corner_marks(cr, margin=60, size=30, alpha=0.08):
+    """Registration marks in corners — industrial print vibe."""
+    cr.set_source_rgba(1, 1, 1, alpha)
+    cr.set_line_width(1.0)
+    corners = [
+        (margin, margin),
+        (W - margin, margin),
+        (margin, H - margin),
+        (W - margin, H - margin),
+    ]
+    for cx, cy in corners:
+        cr.move_to(cx - size, cy)
+        cr.line_to(cx + size, cy)
+        cr.stroke()
+        cr.move_to(cx, cy - size)
+        cr.line_to(cx, cy + size)
+        cr.stroke()
+        cr.arc(cx, cy, 4, 0, 2 * math.pi)
+        cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Wallpaper variants
+# ═════════════════════════════════════════════════════════════
+
+def wall_minimal():
+    """Minimal — perforation + logo + corner marks."""
+    surface, cr = make_surface()
+    draw_perforation(cr, cell=20, dot_r=1.0, alpha=0.03)
+    draw_nothing_logo(cr, W / 2, H / 2, size=280, alpha=0.06)
+    draw_corner_marks(cr)
+    return surface
+
+
+def wall_concentric():
+    """Concentric rings emanating from center."""
+    surface, cr = make_surface()
+    draw_perforation(cr, cell=22, dot_r=0.8, alpha=0.025)
+    draw_concentric_rings(cr, W / 2, H / 2,
+                           count=12, spacing=55,
+                           dot_r=1.3, alpha=0.05)
+    draw_nothing_logo(cr, W / 2, H / 2, size=200, alpha=0.10)
+    draw_accent_dots(cr, count=25, min_r=1.5, max_r=4)
+    return surface
+
+
+def wall_grid():
+    """Grid + scattered accent dots."""
+    surface, cr = make_surface()
+    draw_grid_lines(cr, spacing=80, alpha=0.02)
+    draw_perforation(cr, cell=16, dot_r=0.7, alpha=0.025)
+    draw_nothing_logo(cr, W * 0.15, H * 0.85, size=160, alpha=0.05)
+    draw_accent_dots(cr, count=60, min_r=1, max_r=3)
+    draw_corner_marks(cr)
+    return surface
+
+
+def wall_text():
+    """NOTHING text as dot matrix + perforation."""
+    surface, cr = make_surface()
+    draw_perforation(cr, cell=18, dot_r=0.9, alpha=0.03)
+    draw_dot_matrix_text(cr, 'NOTHING', W / 2, H / 2,
+                          cell=16, alpha=0.08)
+    draw_accent_dots(cr, count=30, min_r=2, max_r=5)
+    draw_corner_marks(cr)
+    return surface
+
+
+def wall_asymmetric():
+    """Off-center logo with gradient perforation density."""
+    surface, cr = make_surface()
+
+    # Dense perforation left, sparse right
+    for r in range(0, H, 14):
+        for c in range(0, W, 14):
+            x = c + 7
+            y = r + 7
+            # Density decreases from left to right
+            density = 1.0 - (x / W) * 0.7
+            if random.random() < density:
+                cr.set_source_rgba(1, 1, 1, 0.03)
+                cr.arc(x, y, 0.8, 0, 2 * math.pi)
+                cr.fill()
+
+    # Logo offset to right
+    draw_nothing_logo(cr, W * 0.72, H * 0.45, size=350, alpha=0.07)
+
+    # Red accent cluster bottom-left
+    for _ in range(15):
+        x = random.gauss(W * 0.2, 100)
+        y = random.gauss(H * 0.75, 80)
+        r = random.uniform(2, 8)
+        cr.set_source_rgba(*RED, random.uniform(0.04, 0.15))
+        cr.arc(x, y, r, 0, 2 * math.pi)
+        cr.fill()
+
+    draw_corner_marks(cr)
+    return surface
+
+
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    variants = [
+        ('nothing-minimal',     wall_minimal),
+        ('nothing-concentric',  wall_concentric),
+        ('nothing-grid',        wall_grid),
+        ('nothing-text',        wall_text),
+        ('nothing-asymmetric',  wall_asymmetric),
+    ]
+
+    for name, fn in variants:
+        print(f"Generating {name}...")
+        surface = fn()
+        path = OUTPUT_DIR / f'{name}.png'
+        surface.write_to_png(str(path))
+        print(f"  → {path}")
+
+    print(f"\nDone! {len(variants)} wallpapers in {OUTPUT_DIR}")
+    print(f"\nSet wallpaper with:")
+    print(f"  hyprctl hyprpaper wallpaper 'eDP-1,{OUTPUT_DIR}/nothing-minimal.png'")
+    print(f"  # or use swww:")
+    print(f"  swww img {OUTPUT_DIR}/nothing-minimal.png --transition-type center")
+
+
+if __name__ == '__main__':
+    main()

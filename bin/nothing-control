@@ -1,0 +1,1928 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Control Center
+Premium edition with authentic Nothing OS design language:
+  - circular toggle buttons (canonical Nothing pattern)
+  - dot-matrix hero clock
+  - clean minimal sliders without containers
+  - unified visual hierarchy
+  - single accent color discipline
+"""
+
+import os
+import sys
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        '/usr/lib/libgtk4-layer-shell.so',
+        '/usr/lib/libgtk4-layer-shell.so.0',
+        '/usr/lib64/libgtk4-layer-shell.so',
+        '/usr/lib64/libgtk4-layer-shell.so.0',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so',
+        '/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0',
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get('LD_PRELOAD', '')
+    if lib_path in current:
+        return
+    os.environ['LD_PRELOAD'] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+
+try:
+    gi.require_version('Gtk4LayerShell', '1.0')
+    from gi.repository import Gtk4LayerShell as LayerShell
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk, Pango, GObject
+import cairo
+import subprocess
+import re
+import math
+import time
+import shutil
+import datetime
+import threading
+import traceback
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home() / '.local/lib/nothing-os'))
+from nothing_style import install_css, fade_in, fade_out
+try:
+    from nothing_notify import notify, notify_success, notify_error, notify_info
+except ImportError:
+    def notify(*a, **kw): return None
+    def notify_success(*a, **kw): return None
+    def notify_error(*a, **kw): return None
+    def notify_info(*a, **kw): return None
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+    def close_other_popups(*a, **kw): pass
+
+
+CONFIG_DIR  = Path.home() / '.config' / 'nothing-control'
+CONFIG_FILE = CONFIG_DIR / 'config.ini'
+STATE_DIR   = Path.home() / '.local' / 'state' / 'nothing-control'
+
+DEFAULTS = {
+    'margin_top':   '12',
+    'margin_right': '12',
+    'width':        '380',
+    'height':       '760',
+}
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED        = (1.000, 0.176, 0.176)
+WHITE      = (1.0, 1.0, 1.0, 1.0)
+WHITE_95   = (1.0, 1.0, 1.0, 0.95)
+WHITE_85   = (1.0, 1.0, 1.0, 0.85)
+WHITE_70   = (1.0, 1.0, 1.0, 0.70)
+WHITE_50   = (1.0, 1.0, 1.0, 0.50)
+WHITE_25   = (1.0, 1.0, 1.0, 0.25)
+WHITE_12   = (1.0, 1.0, 1.0, 0.12)
+WHITE_08   = (1.0, 1.0, 1.0, 0.08)
+WHITE_06   = (1.0, 1.0, 1.0, 0.06)
+WHITE_04   = (1.0, 1.0, 1.0, 0.04)
+BG_DARK    = (0.043, 0.043, 0.047)
+
+
+def log(msg):
+    print(f"[ctrl] {msg}", file=sys.stderr, flush=True)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if not CONFIG_FILE.exists():
+        return cfg
+    try:
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            cfg[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return cfg
+
+
+def _run(cmd, timeout=3):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              check=False, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def _spawn(cmd):
+    try:
+        env = os.environ.copy()
+        try:
+            r = subprocess.run(
+                ['systemctl', '--user', 'show-environment'],
+                capture_output=True, text=True, timeout=1
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        if k not in env or not env[k]:
+                            env[k] = v
+        except Exception:
+            pass
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+        return True
+    except Exception as e:
+        log(f"spawn {cmd}: {e}")
+        return False
+
+
+def _which(name):
+    return shutil.which(name)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Backends
+# ═════════════════════════════════════════════════════════════
+
+class WifiCtl:
+    @staticmethod
+    def enabled():
+        return _run(['nmcli', 'radio', 'wifi']).strip() == 'enabled'
+    @staticmethod
+    def set_enabled(on):
+        subprocess.run(['nmcli', 'radio', 'wifi', 'on' if on else 'off'])
+
+
+class BtCtl:
+    @staticmethod
+    def powered():
+        out = _run(['bluetoothctl', 'show'])
+        return bool(re.search(r'Powered:\s*yes', out))
+    @staticmethod
+    def set_powered(on):
+        subprocess.run(['bluetoothctl', 'power', 'on' if on else 'off'])
+
+
+class AirplaneCtl:
+    @staticmethod
+    def enabled():
+        return not WifiCtl.enabled() and not BtCtl.powered()
+    @staticmethod
+    def set_enabled(on):
+        if on:
+            WifiCtl.set_enabled(False); BtCtl.set_powered(False)
+        else:
+            WifiCtl.set_enabled(True); BtCtl.set_powered(True)
+
+
+class NightCtl:
+    PROCS = ('gammastep', 'wlsunset', 'redshift', 'hyprsunset')
+    @staticmethod
+    def enabled():
+        try:
+            for p in NightCtl.PROCS:
+                r = subprocess.run(['pgrep', '-x', p],
+                                   capture_output=True, text=True, timeout=1)
+                if r.stdout.strip():
+                    return True
+            return False
+        except Exception:
+            return False
+    @staticmethod
+    def set_enabled(on):
+        if on:
+            for p, cmd in [
+                ('gammastep',  ['gammastep', '-O', '3500']),
+                ('hyprsunset', ['hyprsunset', '-t', '3500']),
+                ('wlsunset',   ['wlsunset', '-T', '3500']),
+                ('redshift',   ['redshift', '-O', '3500']),
+            ]:
+                if _which(p):
+                    _spawn(cmd); return
+        else:
+            for p in NightCtl.PROCS:
+                subprocess.run(['pkill', '-x', p], capture_output=True)
+
+
+class DndCtl:
+    @staticmethod
+    def enabled():
+        out = _run(['makoctl', 'mode'])
+        if out.strip():
+            return 'do-not-disturb' in out
+        return _run(['dunstctl', 'is-paused']).strip() == 'true'
+    @staticmethod
+    def set_enabled(on):
+        if _which('makoctl'):
+            if on:
+                subprocess.run(['makoctl', 'mode', '-a', 'do-not-disturb'])
+            else:
+                subprocess.run(['makoctl', 'mode', '-r', 'do-not-disturb'])
+            return
+        if _which('dunstctl'):
+            subprocess.run(['dunstctl', 'set-paused',
+                            'true' if on else 'false'])
+
+
+class CaffeineCtl:
+    PID_FILE = STATE_DIR / 'caffeine.pid'
+    @staticmethod
+    def enabled():
+        if not CaffeineCtl.PID_FILE.exists():
+            return False
+        try:
+            pid = int(CaffeineCtl.PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            try:
+                CaffeineCtl.PID_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+    @staticmethod
+    def set_enabled(on):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if on:
+            if _which('systemd-inhibit'):
+                proc = subprocess.Popen(
+                    ['systemd-inhibit',
+                     '--what=idle:sleep',
+                     '--who=nothing-caffeine',
+                     '--why=User activated caffeine',
+                     'sleep', 'infinity'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                CaffeineCtl.PID_FILE.write_text(str(proc.pid))
+        else:
+            if CaffeineCtl.PID_FILE.exists():
+                try:
+                    pid = int(CaffeineCtl.PID_FILE.read_text().strip())
+                    os.kill(pid, 15)
+                except Exception:
+                    pass
+                try:
+                    CaffeineCtl.PID_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+class BrightnessCtl:
+    @staticmethod
+    def get():
+        out = _run(['brightnessctl', 'get'])
+        max_out = _run(['brightnessctl', 'max'])
+        try:
+            cur = int(out.strip())
+            mx = int(max_out.strip())
+            return int(cur / mx * 100) if mx else 0
+        except Exception:
+            return 0
+    @staticmethod
+    def set(percent):
+        percent = max(1, min(100, int(percent)))
+        subprocess.run(['brightnessctl', 'set', f'{percent}%'],
+                       capture_output=True)
+
+
+class VolumeCtl:
+    @staticmethod
+    def get():
+        out = _run(['pactl', 'get-sink-volume', '@DEFAULT_SINK@'])
+        matches = re.findall(r'(\d+)%', out)
+        if matches:
+            return int(sum(map(int, matches)) / len(matches))
+        return 0
+    @staticmethod
+    def muted():
+        return 'yes' in _run(['pactl', 'get-sink-mute', '@DEFAULT_SINK@'])
+    @staticmethod
+    def set(v):
+        subprocess.run(['pactl', 'set-sink-volume', '@DEFAULT_SINK@',
+                        f'{int(v)}%'])
+    @staticmethod
+    def toggle_mute():
+        subprocess.run(['pactl', 'set-sink-mute', '@DEFAULT_SINK@', 'toggle'])
+
+
+class MediaCtl:
+    @staticmethod
+    def status():
+        if not _which('playerctl'):
+            return None
+        try:
+            status = _run(['playerctl', 'status']).strip()
+            if status not in ('Playing', 'Paused'):
+                return None
+            title = _run(['playerctl', 'metadata', 'title']).strip()
+            artist = _run(['playerctl', 'metadata', 'artist']).strip()
+            player = _run(['playerctl', '-l']).strip().split('\n')[0]
+            return {
+                'status': status,
+                'title': title or 'Unknown',
+                'artist': artist,
+                'player': player,
+            }
+        except Exception:
+            return None
+    @staticmethod
+    def play_pause(): subprocess.run(['playerctl', 'play-pause'])
+    @staticmethod
+    def next(): subprocess.run(['playerctl', 'next'])
+    @staticmethod
+    def previous(): subprocess.run(['playerctl', 'previous'])
+
+
+class SystemCtl:
+    @staticmethod
+    def lock():
+        for cmd in (['hyprlock'], ['swaylock'], ['gtklock'], ['waylock']):
+            if _which(cmd[0]):
+                log(f"lock via {cmd[0]}")
+                _spawn(cmd)
+                return True
+        return False
+    @staticmethod
+    def has_wlogout(): return _which('wlogout') is not None
+    @staticmethod
+    def shutdown(): log("shutdown"); _spawn(['systemctl', 'poweroff'])
+    @staticmethod
+    def reboot(): log("reboot"); _spawn(['systemctl', 'reboot'])
+    @staticmethod
+    def suspend(): log("suspend"); _spawn(['systemctl', 'suspend'])
+    @staticmethod
+    def hibernate(): log("hibernate"); _spawn(['systemctl', 'hibernate'])
+    @staticmethod
+    def logout():
+        log("logout")
+        if _which('hyprctl'):
+            _spawn(['hyprctl', 'dispatch', 'exit', '0'])
+            return
+        _spawn(['loginctl', 'terminate-user', os.getenv('USER', '')])
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers
+# ═════════════════════════════════════════════════════════════
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+def _draw_wifi(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0) if active else WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    base_y = cy + size * 0.28
+    for r in (size * 0.18, size * 0.32, size * 0.46):
+        cr.arc(cx, base_y, r, math.pi + 0.55, 2 * math.pi - 0.55)
+        cr.stroke()
+    cr.arc(cx, base_y, size * 0.08, 0, 2 * math.pi)
+    cr.fill()
+
+
+def _draw_bluetooth(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0) if active else WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.40
+    cr.move_to(cx, cy - s)
+    cr.line_to(cx + s * 0.55, cy - s * 0.35)
+    cr.line_to(cx - s * 0.55, cy + s * 0.35)
+    cr.line_to(cx, cy + s)
+    cr.line_to(cx, cy - s)
+    cr.move_to(cx, cy)
+    cr.line_to(cx + s * 0.55, cy + s * 0.35)
+    cr.line_to(cx - s * 0.55, cy - s * 0.35)
+    cr.stroke()
+
+
+def _draw_moon(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0) if active else WHITE_85)
+    cr.set_source_rgba(*col)
+    r = size * 0.40
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_operator(cairo.OPERATOR_DEST_OUT)
+    cr.arc(cx + r * 0.40, cy - r * 0.15, r * 0.90, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_operator(cairo.OPERATOR_OVER)
+
+
+def _draw_bell_off(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0) if active else WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    r = size * 0.30
+    cr.move_to(cx - r, cy + r * 0.4)
+    cr.line_to(cx - r * 0.85, cy + r * 0.4)
+    cr.curve_to(
+        cx - r * 0.85, cy - r,
+        cx + r * 0.85, cy - r,
+        cx + r * 0.85, cy + r * 0.4
+    )
+    cr.line_to(cx + r, cy + r * 0.4)
+    cr.stroke()
+    cr.arc(cx, cy + r * 0.75, size * 0.07, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_line_width(2.2)
+    cr.move_to(cx - size * 0.42, cy - size * 0.42)
+    cr.line_to(cx + size * 0.42, cy + size * 0.42)
+    cr.stroke()
+
+
+def _draw_plane(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0) if active else WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.46
+    cr.move_to(cx, cy - s)
+    cr.line_to(cx + s * 0.12, cy - s * 0.85)
+    cr.line_to(cx + s * 0.12, cy - s * 0.05)
+    cr.line_to(cx + s * 0.85, cy + s * 0.30)
+    cr.line_to(cx + s * 0.85, cy + s * 0.50)
+    cr.line_to(cx + s * 0.12, cy + s * 0.25)
+    cr.line_to(cx + s * 0.12, cy + s * 0.65)
+    cr.line_to(cx + s * 0.30, cy + s * 0.85)
+    cr.line_to(cx + s * 0.30, cy + s * 0.95)
+    cr.line_to(cx, cy + s * 0.78)
+    cr.line_to(cx - s * 0.30, cy + s * 0.95)
+    cr.line_to(cx - s * 0.30, cy + s * 0.85)
+    cr.line_to(cx - s * 0.12, cy + s * 0.65)
+    cr.line_to(cx - s * 0.12, cy + s * 0.25)
+    cr.line_to(cx - s * 0.85, cy + s * 0.50)
+    cr.line_to(cx - s * 0.85, cy + s * 0.30)
+    cr.line_to(cx - s * 0.12, cy - s * 0.05)
+    cr.line_to(cx - s * 0.12, cy - s * 0.85)
+    cr.close_path()
+    cr.fill()
+
+
+def _draw_caffeine(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0) if active else WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    cr.move_to(cx - s, cy - s * 0.4)
+    cr.line_to(cx - s, cy + s)
+    cr.curve_to(cx - s, cy + s * 1.3,
+                cx + s * 0.65, cy + s * 1.3,
+                cx + s * 0.65, cy + s)
+    cr.line_to(cx + s * 0.65, cy - s * 0.4)
+    cr.line_to(cx - s, cy - s * 0.4)
+    cr.stroke()
+    cr.arc(cx + s * 0.65, cy + s * 0.3, s * 0.45,
+           -math.pi / 2, math.pi / 2)
+    cr.stroke()
+    cr.set_line_width(1.6)
+    for dx in (-s * 0.5, 0, s * 0.5):
+        cr.move_to(cx + dx, cy - s * 0.75)
+        cr.line_to(cx + dx, cy - s * 1.15)
+        cr.stroke()
+
+
+def _draw_sun(cr, cx, cy, active, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    r_inner = size * 0.16
+    cr.arc(cx, cy, r_inner, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    for i in range(8):
+        a = i * math.pi / 4
+        x1 = cx + math.cos(a) * size * 0.26
+        y1 = cy + math.sin(a) * size * 0.26
+        x2 = cx + math.cos(a) * size * 0.42
+        y2 = cy + math.sin(a) * size * 0.42
+        cr.move_to(x1, y1)
+        cr.line_to(x2, y2)
+        cr.stroke()
+
+
+def _draw_speaker(cr, cx, cy, active, muted=False, size=22, color=None):
+    if color is not None:
+        col = _resolve_color(color, WHITE_85)
+    elif muted:
+        col = WHITE
+    else:
+        col = WHITE_85
+    cr.set_source_rgba(*col)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.36
+    cr.move_to(cx - s, cy - s * 0.35)
+    cr.line_to(cx - s * 0.35, cy - s * 0.35)
+    cr.line_to(cx + s * 0.10, cy - s * 0.80)
+    cr.line_to(cx + s * 0.10, cy + s * 0.80)
+    cr.line_to(cx - s * 0.35, cy + s * 0.35)
+    cr.line_to(cx - s, cy + s * 0.35)
+    cr.close_path()
+    cr.fill()
+    if muted:
+        cr.set_line_width(2.0)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.move_to(cx + s * 0.40, cy - s * 0.55)
+        cr.line_to(cx + s * 1.05, cy + s * 0.55)
+        cr.move_to(cx + s * 1.05, cy - s * 0.55)
+        cr.line_to(cx + s * 0.40, cy + s * 0.55)
+        cr.stroke()
+    else:
+        cr.set_line_width(1.8)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.arc(cx + s * 0.10, cy, s * 0.50, -0.55, 0.55)
+        cr.stroke()
+        cr.arc(cx + s * 0.10, cy, s * 0.85, -0.55, 0.55)
+        cr.stroke()
+
+
+def _draw_play_or_pause(cr, cx, cy, playing, size=16, color=None):
+    col = _resolve_color(color, WHITE)
+    cr.set_source_rgba(*col)
+    if playing:
+        cr.rectangle(cx - size * 0.28, cy - size * 0.42,
+                     size * 0.20, size * 0.84)
+        cr.rectangle(cx + size * 0.08, cy - size * 0.42,
+                     size * 0.20, size * 0.84)
+        cr.fill()
+    else:
+        cr.move_to(cx - size * 0.22, cy - size * 0.42)
+        cr.line_to(cx + size * 0.40, cy)
+        cr.line_to(cx - size * 0.22, cy + size * 0.42)
+        cr.close_path()
+        cr.fill()
+
+
+def _draw_next(cr, cx, cy, active=False, size=14, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.move_to(cx - size * 0.40, cy - size * 0.42)
+    cr.line_to(cx + size * 0.18, cy)
+    cr.line_to(cx - size * 0.40, cy + size * 0.42)
+    cr.close_path()
+    cr.fill()
+    cr.rectangle(cx + size * 0.20, cy - size * 0.42,
+                 size * 0.16, size * 0.84)
+    cr.fill()
+
+
+def _draw_prev(cr, cx, cy, active=False, size=14, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.move_to(cx + size * 0.40, cy - size * 0.42)
+    cr.line_to(cx - size * 0.18, cy)
+    cr.line_to(cx + size * 0.40, cy + size * 0.42)
+    cr.close_path()
+    cr.fill()
+    cr.rectangle(cx - size * 0.36, cy - size * 0.42,
+                 size * 0.16, size * 0.84)
+    cr.fill()
+
+
+def _draw_power(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, (*RED, 1.0))
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.2)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    r = size * 0.32
+    cr.arc(cx, cy + 1, r,
+           -math.pi / 2 + 0.55,
+           -math.pi / 2 - 0.55 + 2 * math.pi)
+    cr.stroke()
+    cr.move_to(cx, cy - r - 1)
+    cr.line_to(cx, cy + 1)
+    cr.stroke()
+
+
+def _draw_lock(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    round_rect(cr, cx - s * 0.85, cy - s * 0.15, s * 1.70, s * 1.10, 1.5)
+    cr.fill()
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.arc_negative(cx, cy - s * 0.15, s * 0.55, 0, math.pi)
+    cr.stroke()
+
+
+def _draw_gear(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    teeth = 8
+    inner_r = size * 0.14
+    mid_r = size * 0.26
+    outer_r = size * 0.38
+    for i in range(teeth):
+        a_center = (i / teeth) * 2 * math.pi
+        spread = 0.13
+        a1 = a_center - spread
+        a2 = a_center + spread
+        a3 = a_center + spread * 1.55
+        a4 = a_center - spread * 1.55
+        cr.move_to(cx + math.cos(a1) * mid_r,
+                   cy + math.sin(a1) * mid_r)
+        cr.line_to(cx + math.cos(a4) * outer_r,
+                   cy + math.sin(a4) * outer_r)
+        cr.line_to(cx + math.cos(a3) * outer_r,
+                   cy + math.sin(a3) * outer_r)
+        cr.line_to(cx + math.cos(a2) * mid_r,
+                   cy + math.sin(a2) * mid_r)
+        cr.close_path()
+        cr.fill()
+    cr.set_source_rgba(*col)
+    cr.arc(cx, cy, mid_r, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_operator(cairo.OPERATOR_DEST_OUT)
+    cr.arc(cx, cy, inner_r, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_operator(cairo.OPERATOR_OVER)
+
+
+def _draw_logout(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.30
+    cr.move_to(cx - s * 0.85, cy - s)
+    cr.line_to(cx - s * 0.85, cy + s)
+    cr.line_to(cx + s * 0.10, cy + s)
+    cr.line_to(cx + s * 0.10, cy + s * 0.55)
+    cr.move_to(cx - s * 0.85, cy - s)
+    cr.line_to(cx + s * 0.10, cy - s)
+    cr.line_to(cx + s * 0.10, cy - s * 0.55)
+    cr.stroke()
+    cr.move_to(cx - s * 0.20, cy)
+    cr.line_to(cx + s * 1.20, cy)
+    cr.stroke()
+    cr.move_to(cx + s * 0.65, cy - s * 0.55)
+    cr.line_to(cx + s * 1.20, cy)
+    cr.line_to(cx + s * 0.65, cy + s * 0.55)
+    cr.stroke()
+
+
+def _draw_suspend(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.select_font_face('JetBrains Mono', 0, 1)
+    cr.set_font_size(size * 0.70)
+    ext = cr.text_extents('Z')
+    cr.move_to(cx - ext.width / 2 - ext.x_bearing,
+               cy + ext.height / 2 - 1)
+    cr.show_text('Z')
+
+
+def _draw_reboot(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    r = size * 0.30
+    cr.arc(cx, cy, r, math.pi * 0.35, math.pi * 1.85)
+    cr.stroke()
+    ax = cx + math.cos(math.pi * 1.85) * r
+    ay = cy + math.sin(math.pi * 1.85) * r
+    cr.move_to(ax, ay)
+    cr.line_to(ax + 1, ay - size * 0.18)
+    cr.line_to(ax + size * 0.18, ay - size * 0.04)
+    cr.close_path()
+    cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Big clock — dot matrix
+# ═════════════════════════════════════════════════════════════
+
+DOT_FONT = {
+    '0': ["01110","10001","10011","10101","11001","10001","01110"],
+    '1': ["00100","01100","00100","00100","00100","00100","01110"],
+    '2': ["01110","10001","00001","00010","00100","01000","11111"],
+    '3': ["11110","00001","00001","01110","00001","00001","11110"],
+    '4': ["00010","00110","01010","10010","11111","00010","00010"],
+    '5': ["11111","10000","11110","00001","00001","10001","01110"],
+    '6': ["00110","01000","10000","11110","10001","10001","01110"],
+    '7': ["11111","00001","00010","00100","01000","01000","01000"],
+    '8': ["01110","10001","10001","01110","10001","10001","01110"],
+    '9': ["01110","10001","10001","01111","00001","00010","01100"],
+    ':': ["00000","00000","00100","00000","00100","00000","00000"],
+    ' ': ["00000","00000","00000","00000","00000","00000","00000"],
+}
+
+
+class BigClockMatrix(Gtk.DrawingArea):
+    def __init__(self, height=100):
+        super().__init__()
+        self.text = '00:00'
+        self.set_content_width(280)
+        self.set_content_height(height)
+        self.set_draw_func(self._draw)
+
+    def set_text(self, t):
+        if t != self.text:
+            self.text = t
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        chars = list(self.text)
+        rows = 7
+        cell = min(h / (rows + 1.4), 12)
+        char_w = 5 * cell
+        gap = cell * 0.6
+        total_w = sum(char_w if ch != ':' else cell * 1.5
+                      for ch in chars) + (len(chars) - 1) * gap
+        start_x = (w - total_w) / 2
+        start_y = (h - rows * cell) / 2
+        dot_r = cell * 0.42
+        dot_r_off = cell * 0.16
+        x_cursor = start_x
+        for ch in chars:
+            glyph = DOT_FONT.get(ch, DOT_FONT[' '])
+            this_w = char_w if ch != ':' else cell * 1.5
+            for r in range(rows):
+                for c in range(5):
+                    px = x_cursor + c * cell + cell / 2
+                    py = start_y + r * cell + cell / 2
+                    on = glyph[r][c] == '1'
+                    if on:
+                        cr.set_source_rgba(1, 1, 1, 1)
+                        cr.arc(px, py, dot_r, 0, 2 * math.pi)
+                    else:
+                        cr.set_source_rgba(*WHITE_06)
+                        cr.arc(px, py, dot_r_off, 0, 2 * math.pi)
+                    cr.fill()
+            x_cursor += this_w + gap
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton — universal circular button
+# ═════════════════════════════════════════════════════════════
+
+class CircleButton(Gtk.DrawingArea):
+    """Universal circular button. Same look across the whole UI."""
+    __gsignals__ = {
+        'clicked':  (GObject.SignalFlags.RUN_LAST, None, ()),
+        'toggled':  (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=60, active=False,
+                 toggle=True, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect('pressed', self._on_press)
+        click.connect('released', self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect('enter', self._on_enter)
+        hover.connect('leave', self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit('toggled', self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit('clicked')
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1],
+                                   0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.40)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size,
+                         color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  LabeledCircle — circle + label below
+# ═════════════════════════════════════════════════════════════
+
+class LabeledCircle(Gtk.Box):
+    __gsignals__ = {
+        'toggled': (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+        'clicked': (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, label, icon_fn, active=False, size=56,
+                 toggle=True, accent_only=False):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self._accent_only = accent_only
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.START)
+
+        self.circle = CircleButton(icon_fn, size=size, active=active,
+                                   toggle=toggle, accent_only=accent_only)
+        self.circle.connect('toggled', lambda _c, v: self.emit('toggled', v))
+        self.circle.connect('clicked', lambda _c: self.emit('clicked'))
+        self.append(self.circle)
+
+        self.lbl = Gtk.Label(label=label.upper())
+        self.lbl.add_css_class('tile-label')
+        if accent_only:
+            self.lbl.add_css_class('tile-label-accent')
+        if active and not accent_only:
+            self.lbl.add_css_class('tile-label-active')
+        self.lbl.set_halign(Gtk.Align.CENTER)
+        self.append(self.lbl)
+
+    def set_active(self, a):
+        self.circle.set_active(a)
+        if self._accent_only:
+            return
+        if a:
+            self.lbl.add_css_class('tile-label-active')
+        else:
+            self.lbl.remove_css_class('tile-label-active')
+
+    def get_active(self):
+        return self.circle.get_active()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Minimal slider
+# ═════════════════════════════════════════════════════════════
+
+class NothingSlider(Gtk.DrawingArea):
+    __gsignals__ = {
+        'value-changed': (GObject.SignalFlags.RUN_LAST, None, (int,)),
+    }
+
+    def __init__(self, value=0):
+        super().__init__()
+        self._value = value
+        self._muted = False
+        self._dragging = False
+        self._hover = False
+        self.set_content_height(28)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.connect('pressed', self._on_press)
+        click.connect('released', self._on_release)
+        self.add_controller(click)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', self._on_motion)
+        motion.connect('enter', self._on_enter)
+        motion.connect('leave', self._on_leave)
+        self.add_controller(motion)
+
+        scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        scroll.connect('scroll', self._on_scroll)
+        self.add_controller(scroll)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self.queue_draw()
+
+    def _on_press(self, g, n, x, y):
+        self._dragging = True
+        self._set_from_x(x)
+
+    def _on_release(self, *a):
+        self._dragging = False
+
+    def _on_motion(self, c, x, y):
+        if self._dragging:
+            self._set_from_x(x)
+
+    def _on_scroll(self, c, dx, dy):
+        new = max(0, min(100, self._value + int(-dy * 2)))
+        if new != self._value:
+            self._value = new
+            self.queue_draw()
+            self.emit('value-changed', new)
+
+    def _set_from_x(self, x):
+        w = self.get_width()
+        if w <= 0:
+            return
+        pad = 9
+        eff_w = w - pad * 2
+        new = max(0, min(100, int(round((x - pad) / eff_w * 100))))
+        if new != self._value:
+            self._value = new
+            self.queue_draw()
+            self.emit('value-changed', new)
+
+    def set_value(self, v):
+        v = max(0, min(100, int(v)))
+        if v != self._value:
+            self._value = v
+            self.queue_draw()
+
+    def set_muted(self, m):
+        if m != self._muted:
+            self._muted = m
+            self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        track_h = 3
+        ty = (h - track_h) / 2
+        pad = 9
+        track_x = pad
+        track_w = w - pad * 2
+
+        round_rect(cr, track_x, ty, track_w, track_h, track_h / 2)
+        cr.set_source_rgba(*WHITE_08)
+        cr.fill()
+
+        fill_w = track_w * (self._value / 100)
+        if fill_w > 0:
+            round_rect(cr, track_x, ty, fill_w, track_h, track_h / 2)
+            if self._muted:
+                cr.set_source_rgba(*WHITE_25)
+            else:
+                cr.set_source_rgba(1, 1, 1, 1.0)
+            cr.fill()
+
+        knob_r = 7 if not self._dragging else 8
+        kx = track_x + fill_w
+        ky = h / 2
+
+        cr.set_source_rgba(0, 0, 0, 0.30)
+        cr.arc(kx, ky + 1, knob_r, 0, 2 * math.pi)
+        cr.fill()
+
+        if self._muted:
+            cr.set_source_rgba(*WHITE_50)
+        else:
+            cr.set_source_rgb(1, 1, 1)
+        cr.arc(kx, ky, knob_r, 0, 2 * math.pi)
+        cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Slider row — circle icon + slider + value
+# ═════════════════════════════════════════════════════════════
+
+class SliderRow(Gtk.Box):
+    __gsignals__ = {
+        'value-changed': (GObject.SignalFlags.RUN_LAST, None, (int,)),
+        'icon-clicked':  (GObject.SignalFlags.RUN_LAST, None, ()),
+    }
+
+    def __init__(self, icon_fn, value=0):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.set_margin_top(4)
+        self.set_margin_bottom(4)
+        self.set_margin_start(28)
+        self.set_margin_end(28)
+        self._icon_fn = icon_fn
+        self._muted = False
+
+        self.icon_btn = CircleButton(icon_fn, size=36, toggle=False)
+        self.icon_btn.set_valign(Gtk.Align.CENTER)
+        self.icon_btn.connect('clicked',
+                              lambda _c: self.emit('icon-clicked'))
+        self.append(self.icon_btn)
+
+        self.slider = NothingSlider(value)
+        self.slider.set_valign(Gtk.Align.CENTER)
+        self.slider.connect('value-changed',
+                            lambda _s, v: self.emit('value-changed', v))
+        self.append(self.slider)
+
+        self.value_lbl = Gtk.Label(label=f'{value}')
+        self.value_lbl.add_css_class('slider-val-mono')
+        self.value_lbl.set_valign(Gtk.Align.CENTER)
+        self.append(self.value_lbl)
+
+    def set_value(self, v):
+        self.slider.set_value(v)
+        self.value_lbl.set_text(f'{v}')
+
+    def set_muted(self, m):
+        self._muted = m
+        self.slider.set_muted(m)
+        self.icon_btn.set_active(m)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Media row
+# ═════════════════════════════════════════════════════════════
+
+class MediaTile(Gtk.Box):
+    def __init__(self, on_prev, on_play, on_next):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.set_margin_start(28)
+        self.set_margin_end(28)
+        self.set_margin_top(4)
+        self.set_margin_bottom(4)
+        self._playing = False
+        self._on_play = on_play
+
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        self.title_lbl = Gtk.Label(xalign=0)
+        self.title_lbl.add_css_class('media-title')
+        self.title_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.title_lbl.set_max_width_chars(20)
+        info.append(self.title_lbl)
+
+        self.artist_lbl = Gtk.Label(xalign=0)
+        self.artist_lbl.add_css_class('media-artist')
+        self.artist_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.artist_lbl.set_max_width_chars(24)
+        info.append(self.artist_lbl)
+
+        self.append(info)
+
+        ctrl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        ctrl_box.set_valign(Gtk.Align.CENTER)
+
+        self.prev_btn = CircleButton(_draw_prev, size=32, toggle=False)
+        self.prev_btn.connect('clicked', lambda _c: on_prev())
+        ctrl_box.append(self.prev_btn)
+
+        self.play_btn = CircleButton(self._draw_play_glyph, size=40,
+                                     toggle=False, accent_only=True)
+        self.play_btn.connect('clicked', lambda _c: on_play())
+        ctrl_box.append(self.play_btn)
+
+        self.next_btn = CircleButton(_draw_next, size=32, toggle=False)
+        self.next_btn.connect('clicked', lambda _c: on_next())
+        ctrl_box.append(self.next_btn)
+
+        self.append(ctrl_box)
+
+    def _draw_play_glyph(self, cr, cx, cy, active, size, color=None):
+        _draw_play_or_pause(cr, cx, cy, self._playing, size, color=color)
+
+    def set_media(self, media):
+        if media:
+            self.title_lbl.set_text(media['title'])
+            artist = media.get('artist') or media.get('player') or ''
+            self.artist_lbl.set_text(artist.upper())
+            self._playing = (media['status'] == 'Playing')
+            self.play_btn.queue_draw()
+            self.set_visible(True)
+        else:
+            self.set_visible(False)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Power Menu
+# ═════════════════════════════════════════════════════════════
+
+class PowerMenu(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_default_size(360, 420)
+        self.set_resizable(False)
+        self.set_title('Power')
+        self.add_css_class('popup-window')
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, 'nothing-power')
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self,
+                                         LayerShell.KeyboardMode.EXCLUSIVE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class('main-card')
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(20)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label='POWER', xalign=0)
+        title.add_css_class('window-title')
+        title.set_hexpand(True)
+        header.append(title)
+        outer.append(header)
+
+        for label, icon_fn, action, accent in [
+            ('LOCK',     _draw_lock,    SystemCtl.lock,     False),
+            ('LOGOUT',   _draw_logout,  SystemCtl.logout,   False),
+            ('SUSPEND',  _draw_suspend, SystemCtl.suspend,  False),
+            ('REBOOT',   _draw_reboot,  SystemCtl.reboot,   False),
+            ('SHUTDOWN', _draw_power,   SystemCtl.shutdown, True),
+        ]:
+            btn = self._mk_action_row(label, icon_fn, action, accent)
+            outer.append(btn)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class('card-scroller')
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        scroll.set_child(outer)
+        self.set_content(scroll)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect('key-pressed', self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_action_row(self, label, icon_fn, action, accent):
+        btn = Gtk.Button()
+        btn.add_css_class('power-row')
+        if accent:
+            btn.add_css_class('power-row-danger')
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        box.set_margin_top(14)
+        box.set_margin_bottom(14)
+        box.set_margin_start(24)
+        box.set_margin_end(24)
+
+        icon_da = Gtk.DrawingArea()
+        icon_da.set_content_width(36)
+        icon_da.set_content_height(36)
+        icon_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_icon(a, cr, w, h):
+            cx, cy = w / 2, h / 2
+            r = min(w, h) / 2 - 1
+            if accent:
+                cr.set_source_rgb(*RED)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            if not accent:
+                cr.set_source_rgba(*WHITE_08)
+                cr.set_line_width(1)
+                cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+                cr.stroke()
+            icon_color = WHITE if accent else (1.0, 1.0, 1.0, 0.92)
+            icon_fn(cr, cx, cy, False, 18, color=icon_color)
+
+        icon_da.set_draw_func(_draw_icon)
+        box.append(icon_da)
+
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.add_css_class('power-row-label')
+        if accent:
+            lbl.add_css_class('power-row-label-accent')
+        lbl.set_hexpand(True)
+        box.append(lbl)
+
+        arrow = Gtk.Label(label='›')
+        arrow.add_css_class('power-row-arrow')
+        arrow.set_valign(Gtk.Align.CENTER)
+        box.append(arrow)
+
+        btn.set_child(box)
+
+        def on_click(_b):
+            log(f"power action: {label}")
+            self._dismiss()
+            GLib.timeout_add(120, lambda: (action(), False)[1])
+
+        btn.connect('clicked', on_click)
+        return btn
+
+    def _dismiss(self):
+        self.set_visible(False)
+        self.destroy()
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self._dismiss()
+            return True
+        return False
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+class NothingControlWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self.cfg = load_config()
+        self._refresh_pending = False
+        self._power_menu = None
+
+        self.set_title('nothing-control')
+        self.set_default_size(int(self.cfg['width']),
+                              int(self.cfg['height']))
+        self.set_resizable(False)
+        self.add_css_class('popup-window')
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, 'nothing-control')
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP,
+                                  int(self.cfg['margin_top']))
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT,
+                                  int(self.cfg['margin_right']))
+            LayerShell.set_keyboard_mode(self,
+                                         LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class('outer-wrap')
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class('card-scroller')
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class('main-card')
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label='CONTROL', xalign=0)
+        title.add_css_class('window-title')
+        title.set_hexpand(True)
+        header.append(title)
+        self.user_lbl = Gtk.Label(label=os.getenv('USER', '').upper())
+        self.user_lbl.add_css_class('header-meta')
+        header.append(self.user_lbl)
+        card.append(header)
+
+        # Hero clock
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(22)
+        hero.set_margin_bottom(10)
+        self.clock = BigClockMatrix(height=100)
+        self.clock.set_halign(Gtk.Align.CENTER)
+        hero.append(self.clock)
+        self.date_lbl = Gtk.Label(label='—')
+        self.date_lbl.add_css_class('hero-date')
+        hero.append(self.date_lbl)
+        card.append(hero)
+
+        # Divider
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(20)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # Quick toggles
+        qt_hdr = self._mk_section_hdr('QUICK TOGGLES')
+        card.append(qt_hdr)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(20)
+        grid.set_column_spacing(0)
+        grid.set_margin_start(20)
+        grid.set_margin_end(20)
+        grid.set_margin_top(4)
+        grid.set_column_homogeneous(True)
+        grid.set_halign(Gtk.Align.FILL)
+
+        self.tile_wifi  = LabeledCircle('Wi-Fi',     _draw_wifi)
+        self.tile_bt    = LabeledCircle('Bluetooth', _draw_bluetooth)
+        self.tile_night = LabeledCircle('Night',     _draw_moon)
+        self.tile_dnd   = LabeledCircle('DND',       _draw_bell_off)
+        self.tile_air   = LabeledCircle('Airplane',  _draw_plane)
+        self.tile_caf   = LabeledCircle('Caffeine',  _draw_caffeine)
+
+        self.tile_wifi.connect('toggled',
+            lambda _t, v: self._tile_action('wifi', v))
+        self.tile_bt.connect('toggled',
+            lambda _t, v: self._tile_action('bt', v))
+        self.tile_night.connect('toggled',
+            lambda _t, v: self._tile_action('night', v))
+        self.tile_dnd.connect('toggled',
+            lambda _t, v: self._tile_action('dnd', v))
+        self.tile_air.connect('toggled',
+            lambda _t, v: self._tile_action('air', v))
+        self.tile_caf.connect('toggled',
+            lambda _t, v: self._tile_action('caf', v))
+
+        for i, tile in enumerate([
+            self.tile_wifi, self.tile_bt, self.tile_night,
+            self.tile_dnd,  self.tile_air, self.tile_caf
+        ]):
+            grid.attach(tile, i % 3, i // 3, 1, 1)
+        card.append(grid)
+
+        # Brightness
+        br_hdr = self._mk_section_hdr('BRIGHTNESS')
+        card.append(br_hdr)
+
+        def _br_icon(cr, cx, cy, active, size, color=None):
+            _draw_sun(cr, cx, cy, False, size, color=color)
+        self.br_slider = SliderRow(_br_icon, value=BrightnessCtl.get())
+        self.br_slider.connect('value-changed', self._on_brightness)
+        card.append(self.br_slider)
+
+        # Volume
+        vol_hdr = self._mk_section_hdr('VOLUME')
+        card.append(vol_hdr)
+
+        def _vol_icon(cr, cx, cy, active, size, color=None):
+            muted = self.vol_slider._muted if hasattr(self, 'vol_slider') else False
+            _draw_speaker(cr, cx, cy, False, muted=muted, size=size,
+                          color=color)
+        self.vol_slider = SliderRow(_vol_icon, value=VolumeCtl.get())
+        self.vol_slider.connect('value-changed', self._on_volume)
+        self.vol_slider.connect('icon-clicked', self._on_mute)
+        card.append(self.vol_slider)
+
+        # Media
+        med_hdr = self._mk_section_hdr('NOW PLAYING')
+        card.append(med_hdr)
+
+        self.media = MediaTile(
+            on_prev=lambda: self._spawn_action(MediaCtl.previous),
+            on_play=lambda: self._spawn_action(MediaCtl.play_pause),
+            on_next=lambda: self._spawn_action(MediaCtl.next),
+        )
+        card.append(self.media)
+
+        # System
+        sys_hdr = self._mk_section_hdr('SYSTEM')
+        card.append(sys_hdr)
+
+        sys_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        sys_row.set_margin_start(20)
+        sys_row.set_margin_end(20)
+        sys_row.set_margin_top(4)
+        sys_row.set_homogeneous(True)
+
+        lock_btn = LabeledCircle('LOCK', _draw_lock, toggle=False)
+        lock_btn.connect('clicked', lambda _t: self._action_lock())
+        sys_row.append(lock_btn)
+
+        settings_btn = LabeledCircle('SETTINGS', _draw_gear, toggle=False)
+        settings_btn.connect('clicked', lambda _t: self._action_settings())
+        sys_row.append(settings_btn)
+
+        power_btn = LabeledCircle('POWER', _draw_power, toggle=False,
+                                  accent_only=True)
+        power_btn.connect('clicked', lambda _t: self._action_power())
+        sys_row.append(power_btn)
+
+        card.append(sys_row)
+
+        bottom_spacer = Gtk.Box()
+        bottom_spacer.set_size_request(-1, 28)
+        card.append(bottom_spacer)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        wheel.connect('scroll', self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        GLib.timeout_add_seconds(1, self._tick_clock)
+        self._tick_clock()
+        self._kick_refresh()
+        GLib.timeout_add(2500, self._auto_refresh)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect('key-pressed', self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_section_hdr(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(24)
+        row.set_margin_bottom(14)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class('section-header-clean')
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(),
+                  min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _tick_clock(self):
+        now = datetime.datetime.now()
+        self.clock.set_text(now.strftime('%H:%M'))
+        self.date_lbl.set_text(now.strftime('%a, %d %b').upper())
+        return True
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+
+        def worker():
+            try:
+                state = {
+                    'wifi':       WifiCtl.enabled(),
+                    'bt':         BtCtl.powered(),
+                    'night':      NightCtl.enabled(),
+                    'dnd':        DndCtl.enabled(),
+                    'air':        AirplaneCtl.enabled(),
+                    'caf':        CaffeineCtl.enabled(),
+                    'brightness': BrightnessCtl.get(),
+                    'volume':     VolumeCtl.get(),
+                    'muted':      VolumeCtl.muted(),
+                    'media':      MediaCtl.status(),
+                }
+            except Exception as e:
+                log(f"refresh: {e}")
+                state = None
+            GLib.idle_add(self._apply, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, state):
+        self._refresh_pending = False
+        if not state:
+            return False
+        self.tile_wifi.set_active(state['wifi'])
+        self.tile_bt.set_active(state['bt'])
+        self.tile_night.set_active(state['night'])
+        self.tile_dnd.set_active(state['dnd'])
+        self.tile_air.set_active(state['air'])
+        self.tile_caf.set_active(state['caf'])
+        self.br_slider.set_value(state['brightness'])
+        self.vol_slider.set_value(state['volume'])
+        self.vol_slider.set_muted(state['muted'])
+        self.media.set_media(state['media'])
+        return False
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    def _spawn_action(self, fn, *args):
+        def worker():
+            try:
+                fn(*args)
+            except Exception as e:
+                log(f"action: {e}")
+            GLib.idle_add(self._kick_refresh)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _tile_action(self, kind, value):
+        action_map = {
+            'wifi':  (WifiCtl.set_enabled,    'Wi-Fi',     'network-wireless'),
+            'bt':    (BtCtl.set_powered,      'Bluetooth', 'bluetooth'),
+            'night': (NightCtl.set_enabled,   'Night light',
+                                              'weather-clear-night'),
+            'dnd':   (DndCtl.set_enabled,     'Do Not Disturb',
+                                              'notifications-disabled'),
+            'air':   (AirplaneCtl.set_enabled,'Airplane mode',
+                                              'airplane-mode'),
+            'caf':   (CaffeineCtl.set_enabled,'Caffeine',  'coffee'),
+        }
+        fn, name, icon = action_map[kind]
+        def worker():
+            try:
+                fn(value)
+                notify_info(
+                    f"{name} {'on' if value else 'off'}",
+                    app='nothing-control',
+                    icon=icon,
+                    timeout=1500,
+                )
+            except Exception as e:
+                notify_error(f'{name} failed', str(e),
+                             app='nothing-control')
+            GLib.idle_add(self._kick_refresh)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_brightness(self, _row, v):
+        self._spawn_action(BrightnessCtl.set, v)
+
+    def _on_volume(self, _row, v):
+        self._spawn_action(VolumeCtl.set, v)
+
+    def _on_mute(self, _row):
+        self._spawn_action(VolumeCtl.toggle_mute)
+
+    def _action_lock(self):
+        log("LOCK pressed")
+        self.hide_popup()
+        def worker():
+            if not SystemCtl.lock():
+                notify_error('Lock failed',
+                             'Install hyprlock or swaylock',
+                             app='nothing-control')
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _action_settings(self):
+        log("SETTINGS pressed")
+        self.hide_popup()
+        if _which('nothing-about'):
+            _spawn(['nothing-about'])
+        else:
+            for cmd in (['gnome-control-center'],
+                        ['systemsettings'],
+                        ['xfce4-settings-manager']):
+                if _which(cmd[0]):
+                    _spawn(cmd)
+                    return
+            notify_error('Settings unavailable',
+                         'No settings application found',
+                         app='nothing-control')
+
+    def _action_power(self):
+        log("POWER pressed")
+        self.hide_popup()
+        GLib.timeout_add(120, self._open_power_menu)
+
+    def _open_power_menu(self):
+        try:
+            self._power_menu = PowerMenu(self.app)
+            self._power_menu.present()
+        except Exception as e:
+            log(f"PowerMenu error: {e}\n{traceback.format_exc()}")
+            notify_error(
+                'Power menu failed',
+                'Use terminal: systemctl poweroff/reboot/suspend',
+                app='nothing-control'
+            )
+        return False
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups('nothing-control')
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140,
+                 on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+class NothingControlApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.55);
+        letter-spacing: 2.5px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .tile-label {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.70);
+        letter-spacing: 1.5px;
+    }
+    .tile-label-active {
+        color: #FF2D2D;
+        font-weight: 700;
+    }
+    .tile-label-accent {
+        color: #FF2D2D;
+        font-weight: 700;
+    }
+    .slider-val-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.75);
+        letter-spacing: 0.5px;
+        min-width: 32px;
+    }
+    .media-title {
+        font-family: "Inter", sans-serif;
+        font-weight: 700;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .media-artist {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.50);
+        letter-spacing: 1.5px;
+        margin-top: 2px;
+    }
+    .power-row {
+        background: transparent;
+        border: none;
+        border-radius: 0;
+        padding: 0;
+        transition: background 120ms ease;
+    }
+    .power-row:hover {
+        background: rgba(255, 255, 255, 0.03);
+    }
+    .power-row-danger:hover {
+        background: rgba(255, 45, 45, 0.06);
+    }
+    .power-row-label {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 1.5px;
+    }
+    .power-row-label-accent {
+        color: #FF2D2D;
+    }
+    .power-row-arrow {
+        font-family: "Inter", sans-serif;
+        font-size: 18px;
+        color: rgba(255, 255, 255, 0.30);
+        padding-right: 4px;
+    }
+    .power-row:hover .power-row-arrow {
+        color: rgba(255, 255, 255, 0.70);
+    }
+    .power-row-danger:hover .power-row-arrow {
+        color: #FF2D2D;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id='tech.nothing.control',
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE
+        )
+        self.window = None
+        for opt, short, desc in [
+            ('toggle', 't', 'Toggle popup'),
+            ('show',   's', 'Show popup'),
+            ('hide',   'h', 'Hide popup'),
+            ('power',  'P', 'Show power menu directly'),
+            ('daemon', 'd', 'Run as daemon'),
+            ('quit',   'q', 'Quit'),
+        ]:
+            self.add_main_option(opt, ord(short), GLib.OptionFlags.NONE,
+                                 GLib.OptionArg.NONE, desc, None)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(
+            Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingControlWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if 'quit' in opts:
+            self.quit()
+            return 0
+        if 'power' in opts:
+            try:
+                menu = PowerMenu(self)
+                menu.present()
+            except Exception as e:
+                log(f"direct power menu: {e}")
+            return 0
+        if 'hide' in opts:
+            self.window.hide_popup()
+        elif 'toggle' in opts:
+            self.window.toggle_popup()
+        elif 'show' in opts:
+            self.window.show_popup()
+        elif 'daemon' in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == '__main__':
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    app = NothingControlApp()
+    sys.exit(app.run(sys.argv))

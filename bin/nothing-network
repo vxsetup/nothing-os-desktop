@@ -1,0 +1,1593 @@
+#!/usr/bin/env python3
+"""
+Nothing OS — Network
+Unified with control/volume/notifications design language:
+  - red glyph dot in header
+  - hero dot-matrix wifi signal with concentric pulsing rings
+  - CircleButton for Wi-Fi/Ethernet toggles
+  - flat network rows with signal bars
+  - password prompt as proper layer-shell window
+"""
+
+import os
+import sys
+
+
+def _ensure_layer_shell_preload():
+    LAYER_SHELL_PATHS = [
+        "/usr/lib/libgtk4-layer-shell.so",
+        "/usr/lib/libgtk4-layer-shell.so.0",
+        "/usr/lib64/libgtk4-layer-shell.so",
+        "/usr/lib64/libgtk4-layer-shell.so.0",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so",
+        "/usr/lib/x86_64-linux-gnu/libgtk4-layer-shell.so.0",
+    ]
+    lib_path = next((p for p in LAYER_SHELL_PATHS if os.path.exists(p)), None)
+    if not lib_path:
+        return
+    current = os.environ.get("LD_PRELOAD", "")
+    if lib_path in current:
+        return
+    os.environ["LD_PRELOAD"] = f"{lib_path}:{current}" if current else lib_path
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_layer_shell_preload()
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAS_LAYER_SHELL = True
+except (ValueError, ImportError):
+    HAS_LAYER_SHELL = False
+
+import math
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+import cairo
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, str(Path.home() / ".local/lib/nothing-os"))
+from nothing_style import fade_in, fade_out, install_css
+
+try:
+    from nothing_notify import notify, notify_error, notify_info, notify_success
+except ImportError:
+
+    def notify(*a, **kw):
+        return None
+
+    def notify_success(*a, **kw):
+        return None
+
+    def notify_error(*a, **kw):
+        return None
+
+    def notify_info(*a, **kw):
+        return None
+
+
+try:
+    from nothing_singleton import close_other_popups
+except ImportError:
+
+    def close_other_popups(*a, **kw):
+        pass
+
+
+# ═════════════════════════════════════════════════════════════
+#  Palette
+# ═════════════════════════════════════════════════════════════
+
+RED = (1.000, 0.176, 0.176)
+WHITE = (1.0, 1.0, 1.0, 1.0)
+WHITE_95 = (1.0, 1.0, 1.0, 0.95)
+WHITE_85 = (1.0, 1.0, 1.0, 0.85)
+WHITE_70 = (1.0, 1.0, 1.0, 0.70)
+WHITE_50 = (1.0, 1.0, 1.0, 0.50)
+WHITE_25 = (1.0, 1.0, 1.0, 0.25)
+WHITE_12 = (1.0, 1.0, 1.0, 0.12)
+WHITE_08 = (1.0, 1.0, 1.0, 0.08)
+WHITE_06 = (1.0, 1.0, 1.0, 0.06)
+WHITE_04 = (1.0, 1.0, 1.0, 0.04)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Backend
+# ═════════════════════════════════════════════════════════════
+
+
+class NetworkBackend:
+    @staticmethod
+    def _run(cmd, timeout=5):
+        try:
+            return subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=timeout
+            ).stdout
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _nmcli(*args, timeout=5):
+        return NetworkBackend._run(
+            ["nmcli", "-t", "-e", "no"] + list(args), timeout=timeout
+        )
+
+    @staticmethod
+    def wifi_enabled():
+        return NetworkBackend._nmcli("radio", "wifi").strip() == "enabled"
+
+    @staticmethod
+    def set_wifi(on):
+        subprocess.run(["nmcli", "radio", "wifi", "on" if on else "off"])
+
+    @staticmethod
+    def ethernet_status():
+        out = NetworkBackend._nmcli(
+            "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"
+        )
+        for line in out.split("\n"):
+            parts = line.split(":")
+            if len(parts) < 4:
+                continue
+            dev, typ, state, conn = parts[:4]
+            if typ == "ethernet" and state == "connected":
+                return (True, NetworkBackend._device_ip(dev), dev)
+            if typ == "ethernet":
+                return (False, None, dev)
+        return (False, None, None)
+
+    @staticmethod
+    def _device_ip(dev):
+        out = NetworkBackend._nmcli("-f", "IP4.ADDRESS", "device", "show", dev)
+        for line in out.split("\n"):
+            if line.startswith("IP4.ADDRESS"):
+                return line.split(":", 1)[1].split("/")[0]
+        return None
+
+    @staticmethod
+    def current_wifi():
+        out = NetworkBackend._nmcli(
+            "-f", "ACTIVE,SSID,SIGNAL,SECURITY,DEVICE", "device", "wifi", "list"
+        )
+        for line in out.split("\n"):
+            parts = line.split(":")
+            if len(parts) < 5:
+                continue
+            active, ssid, signal, security, dev = parts[:5]
+            if active == "yes" and ssid:
+                return {
+                    "ssid": ssid,
+                    "signal": int(signal) if signal.isdigit() else 0,
+                    "security": security or "open",
+                    "ipaddr": NetworkBackend._device_ip(dev),
+                    "device": dev,
+                }
+        return None
+
+    @staticmethod
+    def scan_wifi():
+        try:
+            subprocess.run(
+                ["nmcli", "device", "wifi", "rescan"], capture_output=True, timeout=2
+            )
+        except Exception:
+            pass
+        out = NetworkBackend._nmcli(
+            "-f", "ACTIVE,SSID,SIGNAL,SECURITY,BSSID", "device", "wifi", "list"
+        )
+        known_ssids = NetworkBackend._known_ssids()
+        nets = []
+        seen = set()
+        for line in out.split("\n"):
+            parts = line.split(":", 4)
+            if len(parts) < 5:
+                continue
+            active, ssid, signal, security, _ = parts
+            if not ssid or ssid in seen:
+                continue
+            seen.add(ssid)
+            nets.append(
+                {
+                    "ssid": ssid,
+                    "signal": int(signal) if signal.isdigit() else 0,
+                    "security": security or "open",
+                    "active": active == "yes",
+                    "known": ssid in known_ssids,
+                }
+            )
+        nets.sort(key=lambda x: (not x["active"], not x["known"], -x["signal"]))
+        return nets
+
+    @staticmethod
+    def _known_ssids():
+        out = NetworkBackend._nmcli("-f", "NAME,TYPE", "connection", "show")
+        result = set()
+        for line in out.split("\n"):
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[1] == "802-11-wireless":
+                result.add(parts[0])
+        return result
+
+    @staticmethod
+    def connect_wifi(ssid, password=None):
+        cmd = ["nmcli", "device", "wifi", "connect", ssid]
+        if password:
+            cmd += ["password", password]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            return (r.returncode == 0, r.stderr.strip() or r.stdout.strip())
+        except Exception as e:
+            return (False, str(e))
+
+    @staticmethod
+    def disconnect_wifi(dev=None):
+        if not dev:
+            current = NetworkBackend.current_wifi()
+            if not current:
+                return False
+            dev = current["device"]
+        try:
+            r = subprocess.run(
+                ["nmcli", "device", "disconnect", dev], capture_output=True, timeout=10
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+
+def short_ssid(ssid, maxlen=22):
+    s = ssid.strip()
+    return s[: maxlen - 1] + "…" if len(s) > maxlen else s
+
+
+def ssid_id(ssid):
+    clean = re.sub(r"[^A-Za-z0-9]", "", ssid).upper()
+    return clean[-6:] if clean else "NET"
+
+
+# ═════════════════════════════════════════════════════════════
+#  Shape helpers
+# ═════════════════════════════════════════════════════════════
+
+
+def round_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def _resolve_color(color, fallback):
+    if color is None:
+        c = fallback
+    else:
+        c = color
+    if len(c) == 3:
+        return (*c, 1.0)
+    return c
+
+
+# ═════════════════════════════════════════════════════════════
+#  Cairo glyphs
+# ═════════════════════════════════════════════════════════════
+
+
+def _draw_wifi(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    base_y = cy + size * 0.30
+    for r in (size * 0.18, size * 0.32, size * 0.46):
+        cr.arc(cx, base_y, r, math.pi + 0.55, 2 * math.pi - 0.55)
+        cr.stroke()
+    cr.arc(cx, base_y, size * 0.08, 0, 2 * math.pi)
+    cr.fill()
+
+
+def _draw_wifi_off(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    base_y = cy + size * 0.30
+    for r in (size * 0.18, size * 0.32, size * 0.46):
+        cr.arc(cx, base_y, r, math.pi + 0.55, 2 * math.pi - 0.55)
+        cr.stroke()
+    cr.arc(cx, base_y, size * 0.08, 0, 2 * math.pi)
+    cr.fill()
+    # Strike-through
+    cr.set_line_width(2.2)
+    cr.move_to(cx - size * 0.42, cy - size * 0.42)
+    cr.line_to(cx + size * 0.42, cy + size * 0.42)
+    cr.stroke()
+
+
+def _draw_ethernet(cr, cx, cy, active=False, size=22, color=None):
+    col = _resolve_color(color, WHITE_85)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(2.0)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.30
+    # Plug body
+    round_rect(cr, cx - s, cy - s * 1.10, s * 2, s * 1.55, 2)
+    cr.stroke()
+    # Pins
+    cr.set_line_width(1.8)
+    for dx in (-s * 0.55, -s * 0.20, s * 0.20, s * 0.55):
+        cr.move_to(cx + dx, cy + s * 0.45)
+        cr.line_to(cx + dx, cy + s * 0.95)
+        cr.stroke()
+    # Cable
+    cr.set_line_width(2.0)
+    cr.move_to(cx, cy + s * 0.95)
+    cr.line_to(cx, cy + s * 1.30)
+    cr.stroke()
+
+
+def _draw_lock(cr, cx, cy, active=False, size=12, color=None):
+    col = _resolve_color(color, WHITE_50)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(1.4)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    s = size * 0.32
+    round_rect(cr, cx - s * 0.85, cy - s * 0.15, s * 1.70, s * 1.10, 1.2)
+    cr.fill()
+    cr.set_source_rgba(*col)
+    cr.set_line_width(1.4)
+    cr.arc_negative(cx, cy - s * 0.15, s * 0.55, 0, math.pi)
+    cr.stroke()
+
+
+def _draw_close(cr, cx, cy, active=False, size=14, color=None):
+    col = _resolve_color(color, WHITE_50)
+    cr.set_source_rgba(*col)
+    cr.set_line_width(1.8)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    s = size * 0.35
+    cr.move_to(cx - s, cy - s)
+    cr.line_to(cx + s, cy + s)
+    cr.move_to(cx + s, cy - s)
+    cr.line_to(cx - s, cy + s)
+    cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  CircleButton (shared)
+# ═════════════════════════════════════════════════════════════
+
+
+class CircleButton(Gtk.DrawingArea):
+    __gsignals__ = {
+        "clicked": (GObject.SignalFlags.RUN_LAST, None, ()),
+        "toggled": (GObject.SignalFlags.RUN_LAST, None, (bool,)),
+    }
+
+    def __init__(self, icon_fn, size=40, active=False, toggle=False, accent_only=False):
+        super().__init__()
+        self.icon_fn = icon_fn
+        self._size = size
+        self._active = active
+        self._toggle = toggle
+        self._accent_only = accent_only
+        self._busy = False
+        self._busy_start = 0
+        self._hover = False
+        self._press = False
+
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.set_button(1)
+        click.connect("pressed", self._on_press)
+        click.connect("released", self._on_release)
+        self.add_controller(click)
+
+        hover = Gtk.EventControllerMotion()
+        hover.connect("enter", self._on_enter)
+        hover.connect("leave", self._on_leave)
+        self.add_controller(hover)
+
+    def _on_enter(self, *a):
+        self._hover = True
+        self.queue_draw()
+
+    def _on_leave(self, *a):
+        self._hover = False
+        self._press = False
+        self.queue_draw()
+
+    def _on_press(self, *a):
+        self._press = True
+        self.queue_draw()
+
+    def _on_release(self, *a):
+        was_press = self._press
+        self._press = False
+        if was_press and not self._busy:
+            if self._toggle:
+                self._busy = True
+                self._busy_start = time.monotonic()
+                self._active = not self._active
+                self.emit("toggled", self._active)
+                GLib.timeout_add(16, self._tick)
+            else:
+                self.emit("clicked")
+        self.queue_draw()
+
+    def _tick(self):
+        elapsed = (time.monotonic() - self._busy_start) * 1000
+        if elapsed >= 350:
+            self._busy = False
+            self.queue_draw()
+            return False
+        self.queue_draw()
+        return True
+
+    def set_active(self, a, emit=False):
+        if a != self._active:
+            self._active = a
+            self.queue_draw()
+            if emit:
+                self.emit("toggled", self._active)
+
+    def get_active(self):
+        return self._active
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2
+        r = min(w, h) / 2 - 1
+
+        is_red = self._active or self._accent_only
+        if is_red:
+            if self._press:
+                cr.set_source_rgba(0.80 * RED[0], 0.80 * RED[1], 0.80 * RED[2], 1.0)
+            else:
+                cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            if self._press:
+                cr.set_source_rgba(*WHITE_12)
+            elif self._hover:
+                cr.set_source_rgba(*WHITE_08)
+            else:
+                cr.set_source_rgba(*WHITE_06)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgba(*WHITE_08)
+            cr.set_line_width(1)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+        icon_size = int(self._size * 0.50)
+        if is_red:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=WHITE)
+        else:
+            self.icon_fn(cr, cx, cy, False, icon_size, color=(1.0, 1.0, 1.0, 0.92))
+
+        if self._busy:
+            elapsed = (time.monotonic() - self._busy_start) * 1000
+            progress = min(1.0, elapsed / 350)
+            cr.set_line_width(1.5)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_red:
+                cr.set_source_rgba(1, 1, 1, 0.80)
+            else:
+                cr.set_source_rgba(RED[0], RED[1], RED[2], 0.85)
+            start_a = -math.pi / 2
+            end_a = start_a + (2 * math.pi * progress)
+            cr.arc(cx, cy, r + 2, start_a, end_a)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  StatusDot
+# ═════════════════════════════════════════════════════════════
+
+
+class StatusDot(Gtk.DrawingArea):
+    def __init__(self, size=10):
+        super().__init__()
+        self.size = size
+        self.active = False
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+
+    def set_active(self, a):
+        self.active = a
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        cx, cy = w / 2, h / 2
+        r = min(w, h) / 2 - 1
+        if self.active:
+            cr.set_source_rgb(*RED)
+            cr.arc(cx, cy, r, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            cr.set_source_rgba(*WHITE_25)
+            cr.set_line_width(1.0)
+            cr.arc(cx, cy, r - 0.5, 0, 2 * math.pi)
+            cr.stroke()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Signal bars — 4 segments
+# ═════════════════════════════════════════════════════════════
+
+
+class SignalBars(Gtk.DrawingArea):
+    def __init__(self, level=0):
+        super().__init__()
+        self.level = level
+        self.active = False
+        self.set_content_width(20)
+        self.set_content_height(14)
+        self.set_draw_func(self._draw)
+
+    def set_level(self, level, active=False):
+        self.level = level
+        self.active = active
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        bars = 4
+        gap = 1.8
+        bar_w = (w - gap * (bars - 1)) / bars
+        filled = 0
+        if self.level >= 75:
+            filled = 4
+        elif self.level >= 50:
+            filled = 3
+        elif self.level >= 25:
+            filled = 2
+        elif self.level > 0:
+            filled = 1
+        for i in range(bars):
+            bar_h = h * (0.25 + 0.25 * i)
+            x = i * (bar_w + gap)
+            y = h - bar_h
+            if i < filled:
+                if self.active:
+                    cr.set_source_rgb(*RED)
+                else:
+                    cr.set_source_rgba(*WHITE_85)
+            else:
+                cr.set_source_rgba(*WHITE_12)
+            round_rect(cr, x, y, bar_w, bar_h, 1)
+            cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Hero Wi-Fi — dot-matrix concentric rings (Nothing pattern)
+# ═════════════════════════════════════════════════════════════
+
+
+class HeroWifi(Gtk.DrawingArea):
+    """
+    Concentric arcs of dots forming wifi signal.
+    - active off: white-50, static
+    - active on:  red, static
+    - scanning:   red, pulsing wave from inside outward
+    """
+
+    def __init__(self, size=140):
+        super().__init__()
+        self.size = size
+        self.active = False
+        self.scanning = False
+        self._phase = 0.0
+        self.set_content_width(size)
+        self.set_content_height(size)
+        self.set_draw_func(self._draw)
+        GLib.timeout_add(50, self._tick)
+
+    def set_active(self, a):
+        if a != self.active:
+            self.active = a
+            self.queue_draw()
+
+    def set_scanning(self, s):
+        if s != self.scanning:
+            self.scanning = s
+            self.queue_draw()
+
+    def _tick(self):
+        if self.scanning:
+            self._phase = (self._phase + 0.035) % 1.0
+            self.queue_draw()
+        return True
+
+    def _draw(self, area, cr, w, h):
+        cx = w / 2
+        cy = h / 2 + h * 0.12  # shift down so wifi rings centred visually
+
+        # Background dot grid (very subtle)
+        cell = 10
+        cols = int(w / cell)
+        rows = int(h / cell)
+        for r in range(rows):
+            for c in range(cols):
+                x = c * cell + cell / 2
+                y = r * cell + cell / 2
+                cr.set_source_rgba(*WHITE_06)
+                cr.arc(x, y, 1.0, 0, 2 * math.pi)
+                cr.fill()
+
+        # Wifi rings — arcs of dots
+        # ring_idx 0 = innermost
+        ring_specs = [
+            (16, 7),
+            (30, 11),
+            (44, 15),
+            (58, 19),
+        ]
+        for ring_idx, (radius, count) in enumerate(ring_specs):
+            for i in range(count):
+                # Distribute dots over upper arc (wifi shape)
+                t = i / (count - 1) if count > 1 else 0.5
+                a = math.pi + 0.55 + (2 * math.pi - 0.55 - (math.pi + 0.55)) * t
+                x = cx + math.cos(a) * radius
+                y = cy + math.sin(a) * radius
+
+                if not self.active:
+                    cr.set_source_rgba(*WHITE_50)
+                    dot_r = 1.8
+                elif self.scanning:
+                    # Pulse wave from inside (idx=0) outward
+                    ring_phase = (ring_idx / len(ring_specs) - self._phase) % 1.0
+                    if ring_phase < 0:
+                        ring_phase += 1.0
+                    intensity = max(0.25, 1.0 - ring_phase * 1.6)
+                    cr.set_source_rgba(RED[0], RED[1], RED[2], intensity)
+                    dot_r = 2.0 + (1.0 - ring_phase) * 1.0
+                else:
+                    cr.set_source_rgb(*RED)
+                    dot_r = 2.2
+
+                cr.arc(x, y, dot_r, 0, 2 * math.pi)
+                cr.fill()
+
+        # Center dot (origin)
+        if self.active:
+            cr.set_source_rgb(*RED)
+        else:
+            cr.set_source_rgba(*WHITE_50)
+        cr.arc(cx, cy, 2.6, 0, 2 * math.pi)
+        cr.fill()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Adapter row — icon + label + circle toggle/status
+# ═════════════════════════════════════════════════════════════
+
+
+class AdapterRow(Gtk.Box):
+    """Row: [icon] Label .......... [right widget]"""
+
+    def __init__(self, label, icon_fn, right_widget):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.set_margin_start(28)
+        self.set_margin_end(20)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+
+        # Icon container — square-ish, just for the glyph
+        self.icon_area = Gtk.DrawingArea()
+        self.icon_area.set_content_width(20)
+        self.icon_area.set_content_height(20)
+        self.icon_area.set_valign(Gtk.Align.CENTER)
+        self._icon_fn = icon_fn
+        self._icon_active = False
+        self.icon_area.set_draw_func(self._draw_icon)
+        self.append(self.icon_area)
+
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.add_css_class("adapter-label-clean")
+        lbl.set_hexpand(True)
+        self.append(lbl)
+
+        right_widget.set_valign(Gtk.Align.CENTER)
+        self.append(right_widget)
+
+    def _draw_icon(self, area, cr, w, h):
+        col = (*RED, 1.0) if self._icon_active else WHITE_70
+        self._icon_fn(cr, w / 2, h / 2, False, 20, color=col)
+
+    def set_icon_active(self, active):
+        if active != self._icon_active:
+            self._icon_active = active
+            self.icon_area.queue_draw()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Wifi network row
+# ═════════════════════════════════════════════════════════════
+
+
+class WifiNetworkRow(Gtk.Button):
+    def __init__(self, net, on_select):
+        super().__init__()
+        self.net = net
+        self.on_select = on_select
+        self._busy = False
+        self.add_css_class("list-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        box.set_margin_top(2)
+        box.set_margin_bottom(2)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+
+        self.signal = SignalBars(net["signal"])
+        self.signal.set_valign(Gtk.Align.CENTER)
+        box.append(self.signal)
+
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info.set_hexpand(True)
+        info.set_valign(Gtk.Align.CENTER)
+
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.name_lbl = Gtk.Label(label=short_ssid(net["ssid"]), xalign=0)
+        self.name_lbl.add_css_class("row-name")
+        self.name_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        name_row.append(self.name_lbl)
+
+        if net["security"] and net["security"].lower() != "open":
+            lock_area = Gtk.DrawingArea()
+            lock_area.set_content_width(12)
+            lock_area.set_content_height(12)
+            lock_area.set_valign(Gtk.Align.CENTER)
+            lock_area.set_draw_func(
+                lambda a, cr, w, h: _draw_lock(cr, w / 2, h / 2, size=12)
+            )
+            name_row.append(lock_area)
+
+        info.append(name_row)
+
+        sub_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.id_lbl = Gtk.Label(label=ssid_id(net["ssid"]), xalign=0)
+        self.id_lbl.add_css_class("row-mac")
+        sub_row.append(self.id_lbl)
+
+        self.status_lbl = Gtk.Label(xalign=0)
+        self.status_lbl.add_css_class("row-status")
+        sub_row.append(self.status_lbl)
+        info.append(sub_row)
+        box.append(info)
+
+        self.right_lbl = Gtk.Label()
+        self.right_lbl.add_css_class("row-action")
+        self.right_lbl.set_valign(Gtk.Align.CENTER)
+        box.append(self.right_lbl)
+
+        self.set_child(box)
+        self.connect("clicked", self._on_click)
+        self.refresh()
+
+    def refresh(self):
+        self.signal.set_level(self.net["signal"], active=self.net["active"])
+        if self.net["active"]:
+            self.add_css_class("active")
+            self.status_lbl.set_text(f"· {self.net['signal']}% · CONNECTED")
+            self.right_lbl.set_text("···" if self._busy else "DISCONNECT")
+        else:
+            self.remove_css_class("active")
+            sec = (self.net["security"] or "").lower()
+            sec_tag = "OPEN" if sec == "open" or not sec else "SECURED"
+            extras = [f"· {self.net['signal']}%", sec_tag]
+            if self.net["known"]:
+                extras.append("SAVED")
+            self.status_lbl.set_text(" · ".join(extras))
+            self.right_lbl.set_text("···" if self._busy else "CONNECT")
+
+    def set_busy(self, busy):
+        self._busy = busy
+        self.refresh()
+        self.set_sensitive(not busy)
+
+    def _on_click(self, _b):
+        if self._busy:
+            return
+        self.on_select(self)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Password prompt — proper layer-shell window
+# ═════════════════════════════════════════════════════════════
+
+
+class PasswordPrompt(Adw.ApplicationWindow):
+    __gsignals__ = {"submitted": (GObject.SignalFlags.RUN_LAST, None, (str,))}
+
+    def __init__(self, app, ssid):
+        super().__init__(application=app)
+        self._ssid = ssid
+        self.set_default_size(360, 240)
+        self.set_resizable(False)
+        self.set_title("Wi-Fi Password")
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-network-pwd")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("main-card")
+
+        # Header
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(8)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="AUTHENTICATE", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+        outer.append(header)
+
+        # SSID label
+        ssid_lbl = Gtk.Label(label=short_ssid(ssid, 30), xalign=0)
+        ssid_lbl.add_css_class("media-title")
+        ssid_lbl.set_margin_start(28)
+        ssid_lbl.set_margin_end(24)
+        ssid_lbl.set_margin_bottom(4)
+        outer.append(ssid_lbl)
+
+        sub_lbl = Gtk.Label(label="ENTER NETWORK PASSWORD", xalign=0)
+        sub_lbl.add_css_class("section-header-clean")
+        sub_lbl.set_margin_start(28)
+        sub_lbl.set_margin_end(24)
+        sub_lbl.set_margin_bottom(14)
+        outer.append(sub_lbl)
+
+        # Password entry
+        self.entry = Gtk.PasswordEntry()
+        self.entry.add_css_class("pwd-entry-clean")
+        self.entry.set_show_peek_icon(True)
+        self.entry.set_margin_start(20)
+        self.entry.set_margin_end(20)
+        self.entry.connect("activate", lambda *_: self._submit())
+        outer.append(self.entry)
+
+        # Buttons
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btns.set_margin_top(18)
+        btns.set_margin_start(20)
+        btns.set_margin_end(20)
+        btns.set_margin_bottom(20)
+        btns.set_halign(Gtk.Align.END)
+
+        cancel = Gtk.Button(label="CANCEL")
+        cancel.add_css_class("btn-pill-ghost")
+        cancel.connect("clicked", lambda *_: self.close())
+        btns.append(cancel)
+
+        ok = Gtk.Button(label="CONNECT")
+        ok.add_css_class("btn-pill-accent")
+        ok.connect("clicked", lambda *_: self._submit())
+        btns.append(ok)
+
+        outer.append(btns)
+        self.set_content(outer)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+    def _submit(self):
+        self.emit("submitted", self.entry.get_text())
+        self.close()
+
+    def _on_key(self, c, keyval, *a):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+
+# ═════════════════════════════════════════════════════════════
+#  Main Window
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingNetworkWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self._refresh_pending = False
+        self._inflight_ssids = set()
+        self._row_cache = {}
+
+        self.set_title("nothing-network")
+        self.set_default_size(380, 720)
+        self.set_resizable(False)
+        self.add_css_class("popup-window")
+
+        if HAS_LAYER_SHELL:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "nothing-network")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 12)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, 12)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_exclusive_zone(self, 0)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.add_css_class("outer-wrap")
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("card-scroller")
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        scroll.set_vexpand(True)
+        scroll.set_overflow(Gtk.Overflow.HIDDEN)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("main-card")
+
+        # ─── Header ───
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        header.set_margin_top(22)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        header.set_margin_bottom(4)
+
+        glyph_da = Gtk.DrawingArea()
+        glyph_da.set_content_width(10)
+        glyph_da.set_content_height(10)
+        glyph_da.set_valign(Gtk.Align.CENTER)
+
+        def _draw_glyph(a, cr, w, h):
+            cr.set_source_rgb(*RED)
+            cr.arc(w / 2, h / 2, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        glyph_da.set_draw_func(_draw_glyph)
+        header.append(glyph_da)
+
+        title = Gtk.Label(label="NETWORK", xalign=0)
+        title.add_css_class("window-title")
+        title.set_hexpand(True)
+        header.append(title)
+        self.header_status = Gtk.Label(label="")
+        self.header_status.add_css_class("header-meta")
+        header.append(self.header_status)
+        card.append(header)
+
+        # ─── Hero — wifi dots ───
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hero.set_halign(Gtk.Align.CENTER)
+        hero.set_margin_top(8)
+        hero.set_margin_bottom(12)
+        self.hero = HeroWifi(size=140)
+        self.hero.set_halign(Gtk.Align.CENTER)
+        hero.append(self.hero)
+        self.hero_status = Gtk.Label(label="OFFLINE")
+        self.hero_status.add_css_class("hero-date")
+        hero.append(self.hero_status)
+        self.hero_ip = Gtk.Label(label="")
+        self.hero_ip.add_css_class("hero-sub-mono")
+        hero.append(self.hero_ip)
+        card.append(hero)
+
+        # ─── Divider ───
+        div = Gtk.DrawingArea()
+        div.set_content_height(1)
+        div.set_margin_top(14)
+        div.set_margin_start(60)
+        div.set_margin_end(60)
+
+        def _draw_div(a, cr, w, h):
+            cr.set_source_rgba(*WHITE_08)
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+
+        div.set_draw_func(_draw_div)
+        card.append(div)
+
+        # ─── ADAPTER section ───
+        ad_hdr = self._mk_section_hdr("ADAPTER")
+        card.append(ad_hdr)
+
+        # Wi-Fi adapter row — toggle circle
+        self.wifi_circle = CircleButton(_draw_wifi, size=40, toggle=True)
+        self.wifi_circle.connect("toggled", self._on_wifi_toggle)
+        self.wifi_adapter = AdapterRow("Wi-Fi", _draw_wifi, self.wifi_circle)
+        card.append(self.wifi_adapter)
+
+        # Ethernet adapter row — status text
+        self.eth_status_lbl = Gtk.Label(label="—")
+        self.eth_status_lbl.add_css_class("row-action")
+        self.eth_adapter = AdapterRow("Ethernet", _draw_ethernet, self.eth_status_lbl)
+        card.append(self.eth_adapter)
+
+        # ─── NETWORKS section ───
+        nets_hdr = self._mk_section_hdr_count("NETWORKS")
+        self.nets_counter = nets_hdr[1]
+        card.append(nets_hdr[0])
+
+        self.nets_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.nets_box.set_margin_start(20)
+        self.nets_box.set_margin_end(20)
+        self.nets_box.set_margin_top(4)
+        card.append(self.nets_box)
+
+        self.empty_label = Gtk.Label(label="SCANNING…")
+        self.empty_label.add_css_class("empty-label-clean")
+        self.empty_label.set_margin_top(28)
+        self.empty_label.set_margin_bottom(28)
+        card.append(self.empty_label)
+
+        bottom = Gtk.Box()
+        bottom.set_size_request(-1, 28)
+        card.append(bottom)
+
+        scroll.set_child(card)
+        outer.append(scroll)
+        self.set_content(outer)
+
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self._on_wheel, scroll)
+        outer.add_controller(wheel)
+
+        self._kick_refresh()
+        GLib.timeout_add(4000, self._auto_refresh)
+
+        ctrl = Gtk.EventControllerKey()
+        ctrl.connect("key-pressed", self._on_key)
+        self.add_controller(ctrl)
+
+    def _mk_section_hdr(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(8)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        return row
+
+    def _mk_section_hdr_count(self, name):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        row.set_margin_start(28)
+        row.set_margin_end(28)
+        row.set_margin_top(22)
+        row.set_margin_bottom(8)
+        lbl = Gtk.Label(label=name, xalign=0)
+        lbl.add_css_class("section-header-clean")
+        lbl.set_hexpand(True)
+        row.append(lbl)
+        counter = Gtk.Label(label="")
+        counter.add_css_class("section-counter-mono")
+        row.append(counter)
+        return (row, counter)
+
+    def _on_wheel(self, controller, dx, dy, scroller):
+        adj = scroller.get_vadjustment()
+        if adj is None:
+            return False
+        step = adj.get_step_increment() or 40
+        new = adj.get_value() + dy * step
+        new = max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(), new))
+        adj.set_value(new)
+        return True
+
+    def _kick_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        self.hero.set_scanning(True)
+
+        def worker():
+            try:
+                state = {
+                    "wifi_on": NetworkBackend.wifi_enabled(),
+                    "current": NetworkBackend.current_wifi(),
+                    "eth": NetworkBackend.ethernet_status(),
+                    "nets": [],
+                }
+                if state["wifi_on"]:
+                    state["nets"] = NetworkBackend.scan_wifi()
+            except Exception as e:
+                print(f"[net] {e}", file=sys.stderr)
+                state = None
+            GLib.idle_add(self._apply, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply(self, state):
+        self._refresh_pending = False
+        self.hero.set_scanning(False)
+        if not state:
+            return False
+
+        wifi_on = state["wifi_on"]
+        current = state["current"]
+        eth_connected, eth_ip, eth_dev = state["eth"]
+        nets = state["nets"]
+
+        # Hero status
+        if current:
+            self.hero.set_active(True)
+            self.hero_status.set_text(current["ssid"].upper())
+            ip = current.get("ipaddr") or ""
+            self.hero_ip.set_text(ip)
+            self.hero_ip.set_visible(bool(ip))
+            self.header_status.set_text(f"{current['signal']}%")
+        elif eth_connected:
+            self.hero.set_active(True)
+            self.hero_status.set_text("ETHERNET")
+            self.hero_ip.set_text(eth_ip or "")
+            self.hero_ip.set_visible(bool(eth_ip))
+            self.header_status.set_text("ETH")
+        else:
+            self.hero.set_active(False)
+            self.hero_status.set_text("OFFLINE")
+            self.hero_ip.set_visible(False)
+            self.header_status.set_text("OFF")
+
+        # Adapter rows
+        self.wifi_circle.set_active(wifi_on, emit=False)
+        self.wifi_adapter.set_icon_active(wifi_on and current is not None)
+        self.eth_adapter.set_icon_active(eth_connected)
+
+        if eth_connected:
+            self.eth_status_lbl.set_text("CONNECTED")
+            self.eth_status_lbl.remove_css_class("row-action-muted")
+            self.eth_status_lbl.add_css_class("row-action-accent")
+        elif eth_dev:
+            self.eth_status_lbl.set_text("UNPLUGGED")
+            self.eth_status_lbl.add_css_class("row-action-muted")
+            self.eth_status_lbl.remove_css_class("row-action-accent")
+        else:
+            self.eth_status_lbl.set_text("—")
+            self.eth_status_lbl.add_css_class("row-action-muted")
+            self.eth_status_lbl.remove_css_class("row-action-accent")
+
+        # Networks
+        if not wifi_on:
+            self._clear_nets()
+            self.empty_label.set_text("WI-FI OFF")
+            self.empty_label.set_visible(True)
+            self.nets_counter.set_text("")
+        elif not nets:
+            self._clear_nets()
+            self.empty_label.set_text("NO NETWORKS")
+            self.empty_label.set_visible(True)
+            self.nets_counter.set_text("")
+        else:
+            self.empty_label.set_visible(False)
+            self._diff_nets(nets)
+            self.nets_counter.set_text(str(len(nets)))
+        return False
+
+    def _clear_nets(self):
+        while child := self.nets_box.get_first_child():
+            self.nets_box.remove(child)
+        self._row_cache.clear()
+
+    def _diff_nets(self, nets):
+        while child := self.nets_box.get_first_child():
+            self.nets_box.remove(child)
+        new_set = {n["ssid"] for n in nets}
+        for ssid in list(self._row_cache.keys()):
+            if ssid not in new_set:
+                del self._row_cache[ssid]
+        for i, net in enumerate(nets):
+            ssid = net["ssid"]
+            if ssid in self._row_cache:
+                row = self._row_cache[ssid]
+                row.net = net
+                if ssid in self._inflight_ssids:
+                    row._busy = True
+                row.refresh()
+            else:
+                row = WifiNetworkRow(net, self._on_net_click)
+                self._row_cache[ssid] = row
+            self.nets_box.append(row)
+            if i < len(nets) - 1:
+                div = Gtk.Box()
+                div.add_css_class("row-divider-inline")
+                div.set_margin_start(20)
+                div.set_margin_end(8)
+                div.set_size_request(-1, 1)
+                self.nets_box.append(div)
+
+    def _auto_refresh(self):
+        if self.get_visible():
+            self._kick_refresh()
+        return True
+
+    def _on_wifi_toggle(self, _t, active):
+        def worker():
+            try:
+                NetworkBackend.set_wifi(active)
+                notify_info(
+                    "Wi-Fi on" if active else "Wi-Fi off",
+                    app="nothing-network",
+                    icon="network-wireless",
+                    timeout=1500,
+                )
+            except Exception as e:
+                print(f"[net] {e}", file=sys.stderr)
+            GLib.idle_add(self._kick_refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_net_click(self, row):
+        net = row.net
+        ssid = net["ssid"]
+        if ssid in self._inflight_ssids:
+            return
+        if net["active"]:
+            self._inflight_ssids.add(ssid)
+            row.set_busy(True)
+
+            def worker():
+                ok = NetworkBackend.disconnect_wifi()
+                if ok:
+                    notify(
+                        "Disconnected",
+                        ssid,
+                        app="nothing-network",
+                        icon="network-wireless",
+                        timeout=2000,
+                    )
+                else:
+                    notify_error("Disconnect failed", ssid, app="nothing-network")
+
+                def done():
+                    self._inflight_ssids.discard(ssid)
+                    if ssid in self._row_cache:
+                        self._row_cache[ssid]._busy = False
+                    self._kick_refresh()
+                    return False
+
+                GLib.idle_add(done)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return
+
+        secured = net["security"] and net["security"].lower() != "open"
+        if secured and not net["known"]:
+            prompt = PasswordPrompt(self.app, ssid)
+            prompt.connect(
+                "submitted", lambda _p, pwd: self._do_connect(row, ssid, pwd)
+            )
+            prompt.present()
+        else:
+            self._do_connect(row, ssid, None)
+
+    def _do_connect(self, row, ssid, password):
+        self._inflight_ssids.add(ssid)
+        row.set_busy(True)
+
+        def worker():
+            ok, err = NetworkBackend.connect_wifi(ssid, password)
+            if ok:
+                cur = NetworkBackend.current_wifi() or {}
+                body = ssid
+                if cur.get("signal"):
+                    body += f"  ·  signal {cur['signal']}%"
+                if cur.get("ipaddr"):
+                    body += f"\n{cur['ipaddr']}"
+                notify_success(
+                    "Connected", body, app="nothing-network", icon="network-wireless"
+                )
+            else:
+                notify_error("Connection failed", err or ssid, app="nothing-network")
+
+            def done():
+                self._inflight_ssids.discard(ssid)
+                if ssid in self._row_cache:
+                    self._row_cache[ssid]._busy = False
+                self._kick_refresh()
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_key(self, controller, keyval, keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_popup()
+            return True
+        return False
+
+    def show_popup(self):
+        close_other_popups("nothing-network")
+        self._kick_refresh()
+        self.set_visible(True)
+        self.present()
+        self.set_opacity(0.0)
+        fade_in(self, duration_ms=180)
+
+    def hide_popup(self):
+        fade_out(self, duration_ms=140, on_done=lambda: self.set_visible(False))
+
+    def toggle_popup(self):
+        if self.get_visible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# ═════════════════════════════════════════════════════════════
+#  Application
+# ═════════════════════════════════════════════════════════════
+
+
+class NothingNetworkApp(Adw.Application):
+    EXTRA_CSS = """
+    .header-meta {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 2px;
+    }
+    .hero-date {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.85);
+        letter-spacing: 2.5px;
+    }
+    .hero-sub-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1px;
+        margin-top: 2px;
+    }
+    .section-header-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 10px;
+        color: rgba(255, 255, 255, 0.45);
+        letter-spacing: 2.5px;
+    }
+    .section-counter-mono {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 10px;
+        color: #FF2D2D;
+        letter-spacing: 1px;
+    }
+    .empty-label-clean {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 600;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.25);
+        letter-spacing: 2px;
+    }
+    .row-divider-inline {
+        background-color: rgba(255, 255, 255, 0.04);
+    }
+    .adapter-label-clean {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+
+    /* List row (wifi networks) — flat */
+    .list-row {
+        background: transparent;
+        background-color: transparent;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 12px;
+        min-height: 0;
+        box-shadow: none;
+        transition: background-color 120ms ease;
+    }
+    .list-row:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+    .list-row.active {
+        background-color: rgba(255, 45, 45, 0.06);
+    }
+    .list-row.active:hover {
+        background-color: rgba(255, 45, 45, 0.10);
+    }
+
+    /* Row text */
+    .row-name {
+        font-family: "Inter", sans-serif;
+        font-weight: 600;
+        font-size: 13px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    .row-mac {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.30);
+        letter-spacing: 1px;
+    }
+    .row-status {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 500;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.50);
+        letter-spacing: 1.5px;
+    }
+    .list-row.active .row-status {
+        color: #FF2D2D;
+    }
+    .row-action {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 9px;
+        color: rgba(255, 255, 255, 0.40);
+        letter-spacing: 1.5px;
+    }
+    .row-action-muted {
+        color: rgba(255, 255, 255, 0.30);
+    }
+    .row-action-accent {
+        color: #FF2D2D;
+    }
+    .list-row:hover .row-action {
+        color: #FFFFFF;
+    }
+    .list-row.active .row-action {
+        color: #FF2D2D;
+    }
+
+    /* Password prompt entry */
+    .pwd-entry-clean {
+        background: rgba(255, 255, 255, 0.04);
+        color: #FFFFFF;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 13px;
+        font-weight: 500;
+        padding: 12px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        letter-spacing: 1px;
+        caret-color: #FF2D2D;
+    }
+    .pwd-entry-clean:focus {
+        border-color: rgba(255, 45, 45, 0.50);
+        background: rgba(255, 255, 255, 0.06);
+    }
+    .pwd-entry-clean image {
+        color: rgba(255, 255, 255, 0.50);
+    }
+
+    /* Buttons in password prompt */
+    .btn-pill-ghost, .btn-pill-accent {
+        font-family: "JetBrains Mono", monospace;
+        font-weight: 700;
+        font-size: 10px;
+        letter-spacing: 2px;
+        padding: 10px 18px;
+        border-radius: 18px;
+        min-height: 0;
+        transition: all 120ms ease;
+    }
+    .btn-pill-ghost {
+        background-color: rgba(255, 255, 255, 0.06);
+        color: rgba(255, 255, 255, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .btn-pill-ghost:hover {
+        background-color: rgba(255, 255, 255, 0.10);
+        color: #FFFFFF;
+    }
+    .btn-pill-accent {
+        background-color: #FF2D2D;
+        color: #FFFFFF;
+        border: 1px solid #FF2D2D;
+    }
+    .btn-pill-accent:hover {
+        background-color: #FF4747;
+        border-color: #FF4747;
+    }
+
+    .media-title {
+        font-family: "Inter", sans-serif;
+        font-weight: 700;
+        font-size: 15px;
+        color: #FFFFFF;
+        letter-spacing: 0.1px;
+    }
+    """
+
+    def __init__(self):
+        super().__init__(
+            application_id="tech.nothing.network",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.window = None
+        for opt, short, desc in [
+            ("toggle", "t", "Toggle popup"),
+            ("show", "s", "Show popup"),
+            ("hide", "h", "Hide popup"),
+            ("daemon", "d", "Run as daemon"),
+            ("quit", "q", "Quit"),
+        ]:
+            self.add_main_option(
+                opt, ord(short), GLib.OptionFlags.NONE, GLib.OptionArg.NONE, desc, None
+            )
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        install_css(extra_css=self.EXTRA_CSS)
+        self.window = NothingNetworkWindow(self)
+        self.hold()
+
+    def do_command_line(self, cmdline):
+        opts = cmdline.get_options_dict().end().unpack()
+        if "quit" in opts:
+            self.quit()
+            return 0
+        if "hide" in opts:
+            self.window.hide_popup()
+        elif "toggle" in opts:
+            self.window.toggle_popup()
+        elif "show" in opts:
+            self.window.show_popup()
+        elif "daemon" in opts:
+            pass
+        else:
+            self.window.toggle_popup()
+        return 0
+
+    def do_activate(self):
+        if self.window:
+            self.window.toggle_popup()
+
+
+if __name__ == "__main__":
+    app = NothingNetworkApp()
+    sys.exit(app.run(sys.argv))
