@@ -13,7 +13,7 @@
 [![Hyprland](https://img.shields.io/badge/Hyprland-0.55+-FF2D2D?style=flat-square&labelColor=141416)](https://hyprland.org)
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-blue?style=flat-square&labelColor=141416&color=8E8E93)](https://archlinux.org)
 [![License](https://img.shields.io/badge/License-MIT-F7F7F7?style=flat-square&labelColor=141416)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/YOUR_USERNAME/nothing-os-desktop?style=flat-square&labelColor=141416&color=FF2D2D)](https://github.com/YOUR_USERNAME/nothing-os-desktop/stargazers)
+[![Stars](https://img.shields.io/github/stars/YOUR_USERNAME/nothing-os-desktop?style=flat-square&labelColor=141416&color=FF2D2D)](https://github.com/vxsetup/nothing-os-desktop/stargazers)
 
 [Watch Demo](https://youtube.com/watch?v=PLACEHOLDER) · [Install](#install) · [Gallery](#gallery) · [Components](#components)
 
@@ -30,7 +30,7 @@
 
 ## Why this exists
 
-I've been a Nothing fan since the Ear (1). When Nothing OS 3.0 dropped, I wanted that same design language on my Linux workstation — pixel-perfect.
+I've been a Nothing fan since the Nothing phone 1. When Nothing OS 1.0 dropped, I wanted that same design language on my Linux workstation — pixel-perfect.
 
 Eight months later, here it is.
 
@@ -56,7 +56,7 @@ This is a **love letter** to the Nothing team — not affiliated, not endorsed, 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/gallery/10-abou.png" /></td>
+<td width="50%"><img src="docs/gallery/10-about.png" /></td>
 <td width="50%"><img src="docs/gallery/02-control.png" /></td>
 </tr>
 <tr>
