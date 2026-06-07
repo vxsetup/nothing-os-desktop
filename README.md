@@ -72,11 +72,11 @@ This is a **love letter** to the Nothing team — not affiliated, not endorsed, 
 <td><b>Bluetooth</b><br/>Massive dot-matrix icon</td>
 </tr>
 <tr>
-<td><img src="docs/gallery/05-workspaces.png" /></td>
+<td><img src="docs/gallery/07-calendar.png" /></td>
 <td><img src="docs/gallery/04-volume.png" /></td>
 </tr>
 <tr>
-<td><b>Workspace switcher</b><br/>Mission-control style with live window thumbnails</td>
+<td><b>Calendar</b><br/>Add events, monitoring date</td>
 <td><b>Volume panel</b><br/>Per-app mixer, device picker, mic controls</td>
 </tr>
 </table>
