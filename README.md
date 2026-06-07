@@ -43,7 +43,6 @@ This is a **love letter** to the Nothing team — not affiliated, not endorsed, 
 
 - **● Authentic NDot dot-matrix font** rendered via Cairo in every UI element
 - **● 12 desktop popups** matching Nothing OS Control Center / Quick Settings / etc
-- **● Live Glyph wallpaper** — concentric red dots pulsing in real-time, reacts to notifications
 - **● Workspace switcher overlay** with proportional window thumbnails
 - **● Custom waybar** — dot indicators, hero clock, mono technical labels
 - **● Hyprlock** — dot-matrix lockscreen with side-tracked mono details
@@ -58,30 +57,32 @@ This is a **love letter** to the Nothing team — not affiliated, not endorsed, 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/gallery/01-desktop.png" /></td>
+<td width="50%"><img src="docs/gallery/10-abou.png" /></td>
 <td width="50%"><img src="docs/gallery/02-control.png" /></td>
 </tr>
 <tr>
-<td><b>Desktop with widgets</b><br/>Dot grid wallpaper, animated glyph, waybar with brand mark</td>
+<td><b>Desktop with about</b>/td>
 <td><b>Control Center</b><br/>Hero NDot clock, circular toggles, minimal sliders</td>
 </tr>
 <tr>
 <td><img src="docs/gallery/03-launcher.png" /></td>
-<td><img src="docs/gallery/04-lockscreen.png" /></td>
+<td><img src="docs/gallery/08-bluetooth.png" /></td>
 </tr>
 <tr>
 <td><b>Launcher</b><br/>Fuzzy search, frequency tracking, flat list UI</td>
-<td><b>Lockscreen</b><br/>Massive dot-matrix clock, pill password input</td>
+<td><b>Bluetooth</b><br/>Massive dot-matrix icon</td>
 </tr>
 <tr>
 <td><img src="docs/gallery/05-workspaces.png" /></td>
-<td><img src="docs/gallery/06-volume.png" /></td>
+<td><img src="docs/gallery/04-volume.png" /></td>
 </tr>
 <tr>
 <td><b>Workspace switcher</b><br/>Mission-control style with live window thumbnails</td>
 <td><b>Volume panel</b><br/>Per-app mixer, device picker, mic controls</td>
 </tr>
 </table>
+
+More screens in docs/gallery
 
 ---
 
@@ -119,12 +120,12 @@ This is a **love letter** to the Nothing team — not affiliated, not endorsed, 
 
 ### One-line install
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/nothing-os-desktop/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vxsetup/nothing-os-desktop/main/install.sh | bash
 ```
 
 ### Manual install
 ```bash
-git clone https://github.com/YOUR_USERNAME/nothing-os-desktop.git
+git clone https://github.com/vxsetup/nothing-os-desktop.git
 cd nothing-os-desktop
 ./install.sh
 ```
