@@ -15,7 +15,7 @@
 [![License](https://img.shields.io/badge/License-MIT-F7F7F7?style=flat-square&labelColor=141416)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/YOUR_USERNAME/nothing-os-desktop?style=flat-square&labelColor=141416&color=FF2D2D)](https://github.com/vxsetup/nothing-os-desktop/stargazers)
 
-[Watch Demo](https://youtube.com/watch?v=PLACEHOLDER) · [Install](#install) · [Gallery](#gallery) · [Components](#components)
+[Watch Demo](https://youtu.be/bZ-CJPF9XCo) · [Install](#install) · [Gallery](#gallery) · [Components](#components)
 
 </div>
 
