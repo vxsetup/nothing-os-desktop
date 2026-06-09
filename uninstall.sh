@@ -12,20 +12,17 @@ confirm_uninstall() {
     cat <<'EOF'
 
   This will remove:
-    · ~/.local/bin/nothing-*           (all helper scripts)
-    · ~/.local/lib/nothing-os/         (Python modules)
-    · /usr/share/plymouth/themes/nothing-os/  (boot theme)
+    · ~/.local/bin/nothing-*
+    · ~/.local/lib/nothing-os/
+    · Plymouth theme (if installed)
 
   This will NOT touch:
-    · ~/.config/hypr/                  (your Hyprland config)
-    · ~/.config/waybar/                (your waybar config)
-    · ~/.config/fish/                  (your fish config)
-    · GTK themes
+    · ~/.config/ (your configs)
     · Wallpapers
-    · Default shell (fish)
+    · Fonts
+    · Shell settings
 
-  To fully revert, restore from backup at ~/.config-backup-*/
-  To change shell back: chsh -s /bin/bash
+  Restore from backup: ~/.config-backup-*/
 
 EOF
     if [[ "${NOTHING_AUTO_YES:-0}" != "1" ]]; then
@@ -34,15 +31,25 @@ EOF
     fi
 }
 
+stop_running() {
+    section "Stopping daemons"
+    for p in nothing-control nothing-volume nothing-network \
+             nothing-bluetooth nothing-notifications nothing-calendar \
+             nothing-launcher nothing-recorder nothing-screenshot \
+             nothing-osd nothing-about nothing-workspaces; do
+        pkill -f "$p" 2>/dev/null && ok "stopped $p" || true
+    done
+}
+
 remove_bin() {
-    section "Removing scripts from ~/.local/bin/"
+    section "Removing scripts"
     for f in "$HOME/.local/bin/"nothing-*; do
         [[ -f "$f" ]] && rm -f "$f" && ok "removed $(basename "$f")"
     done
 }
 
 remove_lib() {
-    section "Removing ~/.local/lib/nothing-os/"
+    section "Removing Python modules"
     if [[ -d "$HOME/.local/lib/nothing-os" ]]; then
         rm -rf "$HOME/.local/lib/nothing-os"
         ok "removed nothing-os/"
@@ -58,13 +65,6 @@ remove_plymouth() {
     fi
 }
 
-stop_running() {
-    section "Stopping running Nothing OS daemons"
-    for p in nothing-glyph-wallpaper nothing-widgets; do
-        pkill -f "$p" 2>/dev/null && ok "stopped $p" || true
-    done
-}
-
 main() {
     info "Nothing OS Desktop — Uninstaller"
     confirm_uninstall
@@ -74,7 +74,7 @@ main() {
     remove_plymouth
     echo
     ok "Uninstall complete."
-    info "Your backup is at: ~/.config-backup-*/"
+    info "Restore configs from: ~/.config-backup-*/"
 }
 
 main "$@"

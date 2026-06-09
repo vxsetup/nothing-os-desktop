@@ -6,12 +6,8 @@
 
 set -euo pipefail
 
-# ─── Paths ───────────────────────────────────────────────────
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/scripts/_common.sh"
-
-# ─── Banner ──────────────────────────────────────────────────
 
 print_banner() {
     cat <<'EOF'
@@ -28,8 +24,6 @@ print_banner() {
 
 EOF
 }
-
-# ─── Pre-flight checks ──────────────────────────────────────
 
 check_arch() {
     if [[ ! -f /etc/arch-release ]]; then
@@ -48,24 +42,19 @@ check_not_root() {
 check_wayland() {
     if [[ -z "${WAYLAND_DISPLAY:-}" ]] && \
        [[ "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
-        warn "Wayland not currently active — that's OK for first install."
+        warn "Wayland not active — OK for first install"
     else
         ok "Wayland session active"
     fi
 }
 
 check_compositor() {
-    if [[ "${XDG_CURRENT_DESKTOP:-}" != "Hyprland" ]] && \
-       ! pgrep -x Hyprland &>/dev/null; then
-        warn "Hyprland not running. Some live operations will be skipped."
-        SKIP_LIVE_OPS=1
+    if ! pgrep -x Hyprland &>/dev/null; then
+        warn "Hyprland not running — live reload will be skipped"
     else
         ok "Hyprland active"
-        SKIP_LIVE_OPS=0
     fi
 }
-
-# ─── Install steps ───────────────────────────────────────────
 
 confirm_install() {
     echo
@@ -75,15 +64,12 @@ confirm_install() {
     echo "  · Copy Nothing OS configs to ~/.config/"
     echo "  · Install scripts to ~/.local/bin/"
     echo "  · Install Python modules to ~/.local/lib/nothing-os/"
-    echo "  · Install fish shell config + set as default shell"
-    echo "  · Install Plymouth theme (requires sudo)"
+    echo "  · Set fish as default shell"
     echo "  · Install wallpapers to ~/Pictures/wallpapers/"
-    echo
-    info "After install, log out and log back into Hyprland."
     echo
     if [[ "${NOTHING_AUTO_YES:-0}" != "1" ]]; then
         read -rp "$(prompt 'Continue? [y/N]: ')" answer
-        [[ "$answer" =~ ^[Yy]$ ]] || die "Cancelled by user."
+        [[ "$answer" =~ ^[Yy]$ ]] || die "Cancelled."
     fi
 }
 
@@ -98,51 +84,39 @@ backup_configs() {
 }
 
 install_configs() {
-    section "Installing user configs"
+    section "Installing configs"
 
     local SRC="$SCRIPT_DIR/config"
     local DST="$HOME/.config"
-
     mkdir -p "$DST"
 
-    local items=(
-        "hypr"
-        "waybar"
-        "mako"
-        "kitty"
-        "starship.toml"
-        "gtk-3.0"
-        "gtk-4.0"
-        "fish"
-    )
-
-    for item in "${items[@]}"; do
-        if [[ -e "$SRC/$item" ]]; then
-            cp -r "$SRC/$item" "$DST/"
-            ok "config/$item → ~/.config/$item"
+    for item in "$SRC"/*; do
+        [[ -e "$item" ]] || continue
+        local name="$(basename "$item")"
+        if [[ -d "$item" ]]; then
+            cp -r "$item" "$DST/"
         else
-            warn "Skipped (missing in repo): config/$item"
+            cp "$item" "$DST/"
         fi
+        ok "config/$name"
     done
 }
 
 install_bin() {
-    section "Installing scripts to ~/.local/bin/"
+    section "Installing scripts"
 
     mkdir -p "$HOME/.local/bin"
-
     for script in "$SCRIPT_DIR/bin/"*; do
-        if [[ -f "$script" ]]; then
-            local name="$(basename "$script")"
-            cp "$script" "$HOME/.local/bin/$name"
-            chmod +x "$HOME/.local/bin/$name"
-            ok "bin/$name"
-        fi
+        [[ -f "$script" ]] || continue
+        local name="$(basename "$script")"
+        cp "$script" "$HOME/.local/bin/$name"
+        chmod +x "$HOME/.local/bin/$name"
+        ok "bin/$name"
     done
 
     if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
-        warn "~/.local/bin is not in your PATH"
-        warn "Add to your shell rc:  set -gx PATH \$HOME/.local/bin \$PATH"
+        warn "~/.local/bin not in PATH"
+        warn "Fish should handle this via fish_add_path"
     fi
 }
 
@@ -153,10 +127,9 @@ install_lib() {
     mkdir -p "$DST"
 
     for f in "$SCRIPT_DIR/lib/"*.py; do
-        if [[ -f "$f" ]]; then
-            cp "$f" "$DST/"
-            ok "lib/$(basename "$f")"
-        fi
+        [[ -f "$f" ]] || continue
+        cp "$f" "$DST/"
+        ok "lib/$(basename "$f")"
     done
 }
 
@@ -173,81 +146,36 @@ install_wallpapers() {
             ok "wallpapers/$(basename "$f")"
         done
     fi
-
-    if [[ ! -f "$DST/glyph.png" ]] && \
-       command -v nothing-wallpaper-gen &>/dev/null; then
-        info "Generating default wallpaper..."
-        nothing-wallpaper-gen --output "$DST/glyph.png" \
-                              --variant glyph --palette dark || true
-        ok "Generated wallpapers/glyph.png"
-    fi
 }
 
 install_fonts() {
-    section "Setting up fonts"
+    section "Fonts"
 
     local FONT_DIR="$HOME/.local/share/fonts"
     mkdir -p "$FONT_DIR"
 
-    warn "NDot font is NOT included (Nothing's IP)."
-    warn "Download manually: https://github.com/Lemmmy/Ndot"
-    warn "Save Ndot-55.otf and Ndot-57.otf to:"
-    warn "  $FONT_DIR/"
-
-    if command -v fc-cache &>/dev/null; then
-        fc-cache -f "$FONT_DIR" &>/dev/null || true
-        ok "Font cache refreshed"
-    fi
-}
-
-install_fish_config() {
-    section "Setting up fish shell"
-
-    if ! command -v fish &>/dev/null; then
-        warn "fish not installed — skipping"
-        return
+    # Copy any fonts included in repo
+    if [[ -d "$SCRIPT_DIR/fonts" ]]; then
+        for f in "$SCRIPT_DIR/fonts/"*.otf "$SCRIPT_DIR/fonts/"*.ttf; do
+            [[ -f "$f" ]] || continue
+            cp "$f" "$FONT_DIR/"
+            ok "fonts/$(basename "$f")"
+        done
     fi
 
-    # Make fish the default shell if it isn't
-    local current_shell
-    current_shell="$(getent passwd "$USER" | cut -d: -f7)"
-    local fish_bin
-    fish_bin="$(command -v fish)"
+    warn "NDot font NOT included (Nothing's IP)"
+    warn "Download: https://github.com/Lemmmy/Ndot"
+    warn "Place Ndot-55.otf + Ndot-57.otf in $FONT_DIR/"
 
-    if [[ "$current_shell" != "$fish_bin" ]]; then
-        info "Changing default shell to fish..."
-        # Ensure fish is in /etc/shells
-        if ! grep -qx "$fish_bin" /etc/shells; then
-            echo "$fish_bin" | sudo tee -a /etc/shells >/dev/null
-        fi
-        if sudo chsh -s "$fish_bin" "$USER" 2>/dev/null; then
-            ok "Default shell changed to fish (takes effect on next login)"
-        else
-            warn "Failed to change shell automatically"
-            warn "Run manually:  chsh -s $fish_bin"
-        fi
-    else
-        ok "fish already the default shell"
-    fi
-
-    # Install starship init in fish config (if not present)
-    local fish_config="$HOME/.config/fish/config.fish"
-    if [[ -f "$fish_config" ]] && \
-       command -v starship &>/dev/null && \
-       ! grep -q "starship init" "$fish_config"; then
-        echo "" >> "$fish_config"
-        echo "# Starship prompt" >> "$fish_config"
-        echo "starship init fish | source" >> "$fish_config"
-        ok "Starship init added to fish config"
-    fi
+    fc-cache -f "$FONT_DIR" &>/dev/null || true
+    ok "Font cache refreshed"
 }
 
 install_plymouth() {
-    section "Installing Plymouth boot theme"
+    section "Plymouth boot theme"
 
-    if ! command -v plymouth &>/dev/null; then
-        warn "plymouth not installed — skipping boot theme"
-        warn "Install: sudo pacman -S plymouth"
+    if ! has_cmd plymouth; then
+        warn "Plymouth not installed — skipping"
         return
     fi
 
@@ -255,32 +183,28 @@ install_plymouth() {
     local DST="/usr/share/plymouth/themes/nothing-os"
 
     if [[ ! -d "$SRC" ]]; then
-        warn "Plymouth theme files not found in repo, generating..."
-        if command -v nothing-plymouth-gen &>/dev/null; then
+        # Try generating assets
+        if has_cmd nothing-plymouth-gen; then
+            info "Generating Plymouth assets..."
             nothing-plymouth-gen
             SRC="/tmp/nothing-plymouth"
         else
-            warn "Skipping Plymouth (theme files missing)"
+            warn "Plymouth theme files missing — skipping"
             return
         fi
     fi
 
-    info "Copying Plymouth theme (requires sudo)..."
-    sudo mkdir -p "$DST"
-    sudo cp -r "$SRC"/* "$DST/"
-
-    info "Setting nothing-os as default Plymouth theme..."
-    sudo plymouth-set-default-theme -R nothing-os 2>/dev/null || \
-        warn "plymouth-set-default-theme failed (may need GRUB regenerate)"
-
-    ok "Plymouth theme installed"
-    warn "For boot theme to work, ensure /etc/default/grub has:"
-    warn '  GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=3"'
-    warn "And rebuild: sudo grub-mkconfig -o /boot/grub/grub.cfg"
+    if [[ -d "$SRC" ]]; then
+        sudo mkdir -p "$DST"
+        sudo cp -r "$SRC"/* "$DST/"
+        sudo plymouth-set-default-theme -R nothing-os 2>/dev/null || \
+            warn "Could not set Plymouth theme"
+        ok "Plymouth theme installed"
+    fi
 }
 
 post_install() {
-    section "Post-install steps"
+    section "Post-install"
     bash "$SCRIPT_DIR/scripts/_post-install.sh"
 }
 
@@ -288,39 +212,28 @@ print_summary() {
     cat <<'EOF'
 
 ═══════════════════════════════════════════════════════════
-  ✓ Nothing OS Desktop installed successfully
+  ✓ Nothing OS Desktop installed
 ═══════════════════════════════════════════════════════════
 
 Next steps:
 
-  1. Download NDot font (REQUIRED for proper visuals):
-     → https://github.com/Lemmmy/Ndot
-     Save Ndot-55.otf + Ndot-57.otf to ~/.local/share/fonts/
+  1. Download NDot font:
+     https://github.com/Lemmmy/Ndot
+     Save to ~/.local/share/fonts/
 
-  2. Restart Hyprland (or log out/in):
+  2. Reload or reboot:
      hyprctl reload
 
-  3. (If installed Plymouth) Rebuild GRUB:
+  3. If Plymouth installed:
      sudo grub-mkconfig -o /boot/grub/grub.cfg
 
-  4. Reboot to see the full experience.
-
-Key bindings:
+Keybindings:
   Super + Space      Launcher
-  Super + Tab        Workspace switcher
+  Super + Tab        Workspaces
   Super + L          Lock screen
   PrintScreen        Screenshot
-  Super + N          Notifications
 
-Live config:
-  ~/.config/hypr/        Hyprland setup
-  ~/.config/fish/        Fish shell config
-  ~/.config/nothing-os/  Per-popup config
-
-Logs:
-  /tmp/nothing-*.log
-
-Documentation:
+Docs:
   https://github.com/vxsetup/nothing-os-desktop
 
 EOF
@@ -331,9 +244,6 @@ EOF
 main() {
     clear
     print_banner
-
-    info "Starting Nothing OS Desktop installation..."
-    echo
 
     check_arch
     check_not_root
@@ -349,7 +259,6 @@ main() {
     install_lib
     install_wallpapers
     install_fonts
-    install_fish_config
     install_plymouth
     post_install
 

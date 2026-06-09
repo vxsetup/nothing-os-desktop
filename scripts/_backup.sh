@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Backup existing configs before installation
+# ═══════════════════════════════════════════════════════════
+#  Nothing OS Desktop — Backup existing configs
+# ═══════════════════════════════════════════════════════════
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +19,7 @@ DIRS_TO_BACKUP=(
     "gtk-3.0"
     "gtk-4.0"
     "fish"
+    "fastfetch"
 )
 
 FILES_TO_BACKUP=(
