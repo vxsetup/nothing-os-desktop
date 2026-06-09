@@ -133,7 +133,7 @@ cd nothing-os-desktop
 ```bash
 sudo pacman -S hyprland hyprlock hypridle waybar grim slurp wf-recorder \
                wl-clipboard pavucontrol brightnessctl playerctl \
-               jq python python-gobject python-pycairo gtk4 gtk4-layer-shell \
+               jq python python-gobject python-cairo gtk4 gtk4-layer-shell \
                ttf-jetbrains-mono-nerd starship eza bat fastfetch \
                bluez bluez-utils networkmanager mako greetd greetd-tuigreet
 
@@ -158,8 +158,6 @@ TOKENS = {
 }
 ```
 
-### Reposition widgets
-Edit `~/.local/state/nothing-os/widgets.json`.
 
 ---
 
